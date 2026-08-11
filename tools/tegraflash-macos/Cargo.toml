@@ -1,0 +1,13 @@
+[package]
+name = "helm-apx-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "NVIDIA APX USB/IP bridge for Apple-silicon macOS"
+
+[dependencies]
+env_logger = "0.11.8"
+log = "0.4.27"
+rusb = "0.9.4"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+usbip = { git = "https://github.com/jiegec/usbip.git", rev = "5561aa4abf372f5d3eb05c65b1474a9489b735f8" }

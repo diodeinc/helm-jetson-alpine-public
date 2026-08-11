@@ -1,0 +1,3 @@
+# The Jetson C4 root port is modular in NVIDIA's 6.8 kernel. Alpine's generic
+# NVMe feature does not include a platform PCIe host controller.
+kernel/drivers/pci/controller/dwc/pcie-tegra194.ko*

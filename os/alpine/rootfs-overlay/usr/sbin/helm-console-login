@@ -1,0 +1,4 @@
+#!/bin/sh
+# Physical possession of Helm's onboard debug USB port grants the bring-up
+# console. Remote access remains key-only.
+exec /bin/login -f root

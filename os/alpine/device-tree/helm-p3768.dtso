@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Helm carrier-board overlay for Jetson Orin NX/Nano (P3767).
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "nvidia,p3768-0000+p3767-0000",
+		     "nvidia,p3768-0000+p3767-0001",
+		     "nvidia,p3768-0000+p3767-0003",
+		     "nvidia,p3768-0000+p3767-0004",
+		     "nvidia,p3768-0000+p3767-0005";
+
+	/* Give every PHY an overlay-local phandle so the controller lists can
+	 * be rebuilt without relying on numeric phandles from a particular SKU.
+	 */
+	fragment@0 {
+		target-path = "/bus@0/padctl@3520000/pads/usb2/lanes/usb2-0";
+		helm_usb2_0: __overlay__ {
+			#phy-cells = <0>;
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/bus@0/padctl@3520000/pads/usb2/lanes/usb2-1";
+		helm_usb2_1: __overlay__ {
+			#phy-cells = <0>;
+			status = "okay";
+		};
+	};
+
+	fragment@2 {
+		target-path = "/bus@0/padctl@3520000/pads/usb2/lanes/usb2-2";
+		helm_usb2_2: __overlay__ {
+			#phy-cells = <0>;
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/bus@0/padctl@3520000/pads/usb3/lanes/usb3-0";
+		__overlay__ { status = "disabled"; };
+	};
+
+	fragment@4 {
+		target-path = "/bus@0/padctl@3520000/pads/usb3/lanes/usb3-1";
+		helm_usb3_1: __overlay__ {
+			#phy-cells = <0>;
+			nvidia,function = "xusb";
+			status = "okay";
+		};
+	};
+
+	fragment@5 {
+		target-path = "/bus@0/padctl@3520000/pads/usb3/lanes/usb3-2";
+		helm_usb3_2: __overlay__ {
+			#phy-cells = <0>;
+			nvidia,function = "xusb";
+			status = "okay";
+		};
+	};
+
+	/* Helm has a USB2-only, sink-wired recovery connector. */
+	fragment@6 {
+		target-path = "/bus@0/padctl@3520000/ports/usb2-0";
+		__overlay__ {
+			mode = "peripheral";
+			status = "okay";
+		};
+	};
+
+	/* USB-C host 1 is USB2-1 paired with physical SuperSpeed lane 1. */
+	fragment@7 {
+		target-path = "/bus@0/padctl@3520000/ports/usb2-1";
+		__overlay__ {
+			mode = "host";
+			vbus-supply = <&vdd_5v0_sys>;
+			status = "okay";
+		};
+	};
+
+	/* USB-C host 2 is USB2-2 paired with physical SuperSpeed lane 2. */
+	fragment@8 {
+		target-path = "/bus@0/padctl@3520000/ports/usb2-2";
+		__overlay__ {
+			mode = "host";
+			vbus-supply = <&vdd_5v0_sys>;
+			status = "okay";
+		};
+	};
+
+	fragment@9 {
+		target-path = "/bus@0/padctl@3520000/ports/usb3-0";
+		__overlay__ { status = "disabled"; };
+	};
+
+	fragment@10 {
+		target-path = "/bus@0/padctl@3520000/ports/usb3-1";
+		__overlay__ {
+			nvidia,usb2-companion = <1>;
+			status = "okay";
+		};
+	};
+
+	fragment@11 {
+		target-path = "/bus@0/padctl@3520000/ports/usb3-2";
+		__overlay__ {
+			nvidia,usb2-companion = <2>;
+			status = "okay";
+		};
+	};
+
+	fragment@12 {
+		target-path = "/bus@0/usb@3550000";
+		__overlay__ {
+			phys = <&helm_usb2_0>;
+			phy-names = "usb2-0";
+			status = "okay";
+		};
+	};
+
+	fragment@13 {
+		target-path = "/bus@0/usb@3610000";
+		__overlay__ {
+			phys = <&helm_usb2_0>, <&helm_usb2_1>, <&helm_usb2_2>,
+			       <&helm_usb3_1>, <&helm_usb3_2>;
+			phy-names = "usb2-0", "usb2-1", "usb2-2",
+				    "usb3-1", "usb3-2";
+			status = "okay";
+		};
+	};
+
+	fragment@14 {
+		target-path = "/bus@0/i2c@c240000/fusb301@25";
+		__overlay__ { status = "disabled"; };
+	};
+
+	fragment@15 {
+		target-path = "/bus@0/i2c@3160000/eeprom@57";
+		__overlay__ { status = "disabled"; };
+	};
+
+	fragment@16 {
+		target-path = "/gpio-keys/key-power";
+		__overlay__ { status = "disabled"; };
+	};
+
+	/* SoM pins 126/127 are AON GPIO CC.0/CC.1. The stock P3767 MB1
+	 * pinmux already configures both as driven GPIOs.
+	 */
+	fragment@17 {
+		target-path = "/";
+		__overlay__ {
+			model = "Diode Helm with NVIDIA Jetson Orin NX/Nano";
+			diode,carrier = "helm";
+
+			/* Helm's 3.3 V rail is not switched by the P3768 carrier
+			 * GPIO. C8 connects the SoC to the GbE PHY on the module.
+			 */
+			helm_vdd_3v3_pcie: helm-vdd-3v3-pcie {
+				compatible = "regulator-fixed";
+				regulator-name = "HELM_VDD_3V3_PCIE";
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-always-on;
+				regulator-boot-on;
+			};
+
+			helm-leds {
+				compatible = "gpio-leds";
+
+				green-status {
+					label = "helm:green:status";
+					gpios = <&gpio_aon 16 0>;
+					linux,default-trigger = "heartbeat";
+					default-state = "on";
+					retain-state-suspended;
+				};
+
+				orange-activity {
+					label = "helm:orange:activity";
+					gpios = <&gpio_aon 17 0>;
+					linux,default-trigger = "disk-activity";
+					default-state = "off";
+					panic-indicator;
+				};
+			};
+		};
+	};
+
+	fragment@18 {
+		target-path = "/bus@0/pcie@140a0000";
+		__overlay__ {
+			vpcie3v3-supply = <&helm_vdd_3v3_pcie>;
+			status = "okay";
+		};
+	};
+
+	/* The stock P3768 regulator depends on a carrier GPIO that Helm does
+	 * not route. Keep the node for overlay compatibility, but never probe it.
+	 */
+	fragment@19 {
+		target-path = "/regulator-vdd-3v3-pcie";
+		__overlay__ { status = "disabled"; };
+	};
+};

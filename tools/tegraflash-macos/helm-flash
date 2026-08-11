@@ -1,0 +1,247 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+L4T_ARCHIVE=${HELM_L4T_ARCHIVE:-$REPO_ROOT/build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2}
+L4T_PARENT=${HELM_L4T_PARENT:-$REPO_ROOT/build/macos-flash-port}
+L4T_DIR=${HELM_L4T_DIR:-$L4T_PARENT/Linux_for_Tegra}
+ALPINE_DIR=${HELM_ALPINE_DIR:-$REPO_ROOT/build/helm-alpine/out}
+FLASH_DIR=${HELM_FLASH_DIR:-$REPO_ROOT/build/helm-alpine/flash}
+TOOLS_DIR=${HELM_MACOS_TOOLS_DIR:-$REPO_ROOT/build/macos-tools}
+IMAGE_NAME=${HELM_TEGRAFLASH_IMAGE:-helm-tegraflash-r39.2:macos}
+
+usage() {
+    echo "usage: $0 <command>"
+    echo
+    echo "commands:"
+    echo "  build       compile the native bridge and recovery-tool container"
+    echo "  doctor      verify macOS, Docker, BSP, Alpine, and attached APX device"
+    echo "  bridge      export NVIDIA recovery USB over USB/IP (foreground)"
+    echo "  prepare     build sparse APP and signed R39.2 flash payloads offline"
+    echo "  verify      verify the generated offline flash payloads"
+    echo
+    echo "prepare and verify never attach USB and never write device storage."
+}
+
+need_file() {
+    if [ ! -f "$1" ]; then
+        echo "missing required file: $1" >&2
+        exit 1
+    fi
+}
+
+ensure_l4t() {
+    if [ ! -x "$L4T_DIR/flash.sh" ]; then
+        need_file "$L4T_ARCHIVE"
+        mkdir -p "$L4T_PARENT"
+        tar -xjf "$L4T_ARCHIVE" -C "$L4T_PARENT"
+    fi
+}
+
+ensure_container() {
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        "$SCRIPT_DIR/build.sh" container
+    fi
+}
+
+ensure_recovery_donor() {
+    marker="$L4T_DIR/rootfs/.helm-recovery-donor-r39.2-v2"
+    if [ -f "$marker" ]; then
+        return
+    fi
+
+    echo "Populating the recovery-only Ubuntu donor rootfs..."
+    donor_tar="$FLASH_DIR/.recovery-donor-r39.2.tar"
+    docker run --rm --platform linux/arm64 \
+        -v "$FLASH_DIR:/output" \
+        "$IMAGE_NAME" \
+        tar -C / -cf /output/.recovery-donor-r39.2.tar bin etc lib sbin usr
+
+    rm -rf -- \
+        "$L4T_DIR/rootfs/bin" \
+        "$L4T_DIR/rootfs/etc" \
+        "$L4T_DIR/rootfs/lib" \
+        "$L4T_DIR/rootfs/sbin" \
+        "$L4T_DIR/rootfs/usr"
+    tar -xf "$donor_tar" -C "$L4T_DIR/rootfs"
+    rm -f -- "$donor_tar"
+
+    docker run --rm --platform linux/arm64 \
+        -v "$L4T_DIR:/l4t" \
+        "$IMAGE_NAME" \
+        bash -euc '
+            test -x /l4t/flash.sh
+            for package in \
+                /l4t/kernel/nvidia-l4t-kernel_*.deb \
+                /l4t/kernel/nvidia-l4t-kernel-oot-modules_*.deb \
+                /l4t/nv_tegra/l4t_deb_packages/nvidia-l4t-kernel-module-configs_*.deb
+            do
+                test -f "$package"
+                dpkg-deb -x "$package" /l4t/rootfs
+            done
+            if [ -d /l4t/rootfs/lib/modules ]; then
+                mkdir -p /l4t/rootfs/usr/lib/modules
+                cp -a /l4t/rootfs/lib/modules/. /l4t/rootfs/usr/lib/modules/
+                rm -rf -- /l4t/rootfs/lib
+                ln -s usr/lib /l4t/rootfs/lib
+            fi
+            kernel_version=$(find /l4t/rootfs/usr/lib/modules \
+                -mindepth 1 -maxdepth 1 -type d -name "*-tegra" \
+                -printf "%f\n" | head -n 1)
+            test -n "$kernel_version"
+            depmod -b /l4t/rootfs "$kernel_version"
+            touch /l4t/rootfs/.helm-recovery-donor-r39.2-v2
+        '
+}
+
+doctor() {
+    failures=0
+    if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+        echo "ok  host: Apple-silicon macOS"
+    else
+        echo "ERR host: expected Apple-silicon macOS"
+        failures=$((failures + 1))
+    fi
+    if docker info >/dev/null 2>&1; then
+        echo "ok  Docker Desktop engine"
+    else
+        echo "ERR Docker Desktop engine is not running"
+        failures=$((failures + 1))
+    fi
+    if [ -f "$L4T_ARCHIVE" ] || [ -x "$L4T_DIR/flash.sh" ]; then
+        echo "ok  Jetson Linux R39.2 BSP"
+    else
+        echo "ERR Jetson Linux R39.2 BSP archive"
+        failures=$((failures + 1))
+    fi
+    if [ -f "$ALPINE_DIR/helm-alpine-3.24.1-l4t-r39.2-rootfs.ext4" ]; then
+        echo "ok  Helm Alpine APP filesystem"
+    else
+        echo "ERR Helm Alpine APP filesystem"
+        failures=$((failures + 1))
+    fi
+    if [ -x "$TOOLS_DIR/bin/helm-apx-bridge" ]; then
+        echo "ok  native helm-apx-bridge"
+    else
+        echo "ERR native helm-apx-bridge (run: $0 build)"
+        failures=$((failures + 1))
+    fi
+    if [ -x "$TOOLS_DIR/bin/apxctl" ]; then
+        "$TOOLS_DIR/bin/apxctl" list || failures=$((failures + 1))
+    else
+        echo "ERR native apxctl (run: ./tools/apx-macos/build.sh)"
+        failures=$((failures + 1))
+    fi
+    [ "$failures" -eq 0 ]
+}
+
+prepare() {
+    raw_image="$ALPINE_DIR/helm-alpine-3.24.1-l4t-r39.2-rootfs.ext4"
+    need_file "$raw_image"
+    ensure_l4t
+    ensure_container
+    mkdir -p "$FLASH_DIR"
+    ensure_recovery_donor
+
+    docker run --rm --platform linux/arm64 \
+        -v "$L4T_DIR/bootloader:/bsp:ro" \
+        -v "$raw_image:/input/system.img.raw:ro" \
+        -v "$FLASH_DIR:/output" \
+        -w /output \
+        "$IMAGE_NAME" \
+        /bsp/mksparse --fillpattern=0 /input/system.img.raw system.img
+
+    cp -f "$FLASH_DIR/system.img" "$L4T_DIR/bootloader/system.img"
+
+    docker run --rm --platform linux/arm64 --privileged \
+        -e USER=root \
+        -e BOARDID=3767 \
+        -e BOARDSKU=0001 \
+        -e FAB=300 \
+        -e CHIP_SKU=00:00:00:D4 \
+        -e FUSELEVEL=fuselevel_production \
+        -v "$L4T_DIR:/l4t" \
+        -w /l4t \
+        "$IMAGE_NAME" \
+        bash -lc './flash.sh --no-flash --sign -r jetson-orin-nano-devkit-nvme external'
+
+    (
+        cd "$FLASH_DIR"
+        shasum -a 256 system.img > SHA256SUMS
+    )
+    (
+        cd "$L4T_DIR/bootloader/signed"
+        find . -maxdepth 1 -type f -print | LC_ALL=C sort | \
+            xargs shasum -a 256 > "$FLASH_DIR/SIGNED_SHA256SUMS"
+    )
+    cp -f "$L4T_DIR/bootloader/flashcmd.txt" "$FLASH_DIR/flashcmd.txt"
+    cp -f "$L4T_DIR/bootloader/secureflash.xml" "$FLASH_DIR/secureflash.xml"
+    verify
+}
+
+verify() {
+    signed="$L4T_DIR/bootloader/signed"
+    need_file "$FLASH_DIR/system.img"
+    need_file "$FLASH_DIR/SHA256SUMS"
+    need_file "$FLASH_DIR/SIGNED_SHA256SUMS"
+    need_file "$L4T_DIR/bootloader/flashcmd.txt"
+    need_file "$L4T_DIR/bootloader/flash.xml.bin"
+    need_file "$L4T_DIR/bootloader/secureflash.xml"
+    need_file "$signed/flash.xml.bin"
+    need_file "$signed/br_bct_BR.bct"
+    need_file "$signed/applet_t234_sigheader.bin.encrypt"
+    need_file "$signed/mb1_t234_prod_aligned_sigheader.bin.encrypt"
+    need_file "$signed/psc_bl1_t234_prod_aligned_sigheader.bin.encrypt"
+    need_file "$signed/mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt"
+    need_file "$signed/mem_rcm_sigheader.bct.encrypt"
+    need_file "$signed/flash.xml.tmp"
+    if ! grep -q 'system.img' "$signed/flash.xml.tmp"; then
+        echo "signed partition manifest does not reference system.img" >&2
+        exit 1
+    fi
+    signed_count=$(find "$signed" -maxdepth 1 -type f | wc -l | tr -d ' ')
+    if [ "$signed_count" -lt 40 ]; then
+        echo "incomplete signed payload set: $signed_count files" >&2
+        exit 1
+    fi
+    file "$FLASH_DIR/system.img"
+    (
+        cd "$FLASH_DIR"
+        shasum -a 256 -c SHA256SUMS
+    )
+    (
+        cd "$signed"
+        shasum -a 256 -c "$FLASH_DIR/SIGNED_SHA256SUMS"
+    )
+    echo "ok  offline R39.2 payload set ($signed_count signed files)"
+    echo "ok  no USB recovery command was issued"
+}
+
+command=${1:-}
+case "$command" in
+    build)
+        "$SCRIPT_DIR/build.sh" all
+        ;;
+    doctor)
+        doctor
+        ;;
+    bridge)
+        need_file "$TOOLS_DIR/bin/helm-apx-bridge"
+        exec "$TOOLS_DIR/bin/helm-apx-bridge" --vid 0x0955
+        ;;
+    prepare)
+        prepare
+        ;;
+    verify)
+        verify
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        echo "unknown command: $command" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

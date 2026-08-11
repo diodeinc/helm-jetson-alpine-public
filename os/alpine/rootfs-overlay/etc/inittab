@@ -1,0 +1,11 @@
+# Helm Alpine init sequence
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# Local display and the physically attached MCP2221 debug UART.
+tty1::respawn:/sbin/getty 38400 tty1
+ttyTCU0::respawn:/sbin/getty -L -n -l /usr/sbin/helm-console-login 115200 ttyTCU0 vt100
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

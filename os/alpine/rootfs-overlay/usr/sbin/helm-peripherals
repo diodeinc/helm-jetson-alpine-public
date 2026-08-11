@@ -1,0 +1,31 @@
+#!/bin/sh
+set -u
+
+set_led_trigger()
+{
+	led=$1
+	desired=$2
+	trigger=/sys/class/leds/$led/trigger
+	if [ -w "$trigger" ] && grep -qw "$desired" "$trigger"; then
+		printf '%s\n' "$desired" > "$trigger"
+	fi
+}
+
+# Device-tree modaliases normally load these automatically. Explicit attempts
+# make early bring-up deterministic while remaining harmless for built-ins.
+modprobe r8168 2>/dev/null || :
+modprobe i2c-dev 2>/dev/null || :
+modprobe pwm-tegra-tachometer 2>/dev/null || :
+
+set_led_trigger helm:green:status heartbeat
+set_led_trigger helm:orange:activity disk-activity
+
+{
+	echo "model=$(tr -d '\000' < /proc/device-tree/model 2>/dev/null || echo unknown)"
+	echo "gpiochips=$(find /dev -maxdepth 1 -name 'gpiochip*' 2>/dev/null | wc -l | tr -d ' ')"
+	echo "nvme=$(find /sys/class/nvme -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+	echo "leds=$(find /sys/class/leds -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+	echo "cooling_devices=$(find /sys/class/thermal -name 'cooling_device*' 2>/dev/null | wc -l | tr -d ' ')"
+} > /run/helm-peripherals
+
+logger -t helm-peripherals "Helm carrier initialization complete"

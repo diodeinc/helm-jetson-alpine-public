@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+read_dt_string()
+{
+	path=$1
+	if [ -r "$path" ]; then
+		tr -d '\000' < "$path"
+	else
+		printf 'unavailable'
+	fi
+}
+
+echo "Helm Alpine"
+if [ -r /etc/alpine-release ]; then
+	echo "  Alpine: $(cat /etc/alpine-release)"
+fi
+if [ -r /etc/helm-release ]; then
+	echo "  BSP: $(sed -n 's/^L4T_RELEASE=//p' /etc/helm-release)"
+fi
+
+if [ "${1:-}" = "--offline" ]; then
+	echo "  Architecture: $(uname -m)"
+	exit 0
+fi
+
+echo "  Model: $(read_dt_string /proc/device-tree/model)"
+echo "  Kernel: $(uname -r)"
+echo "  Root: $(findmnt -n -o SOURCE / 2>/dev/null || echo unknown)"
+
+if [ -r /run/helm-peripherals ]; then
+	echo "  Peripheral initialization:"
+	sed 's/^/    /' /run/helm-peripherals
+fi
+
+echo "  Network:"
+ip -brief link 2>/dev/null | sed 's/^/    /' || :
+echo "  PCIe/NVMe:"
+lspci 2>/dev/null | sed 's/^/    /' || :
+nvme list 2>/dev/null | sed 's/^/    /' || :

@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+usage()
+{
+	echo "usage: helm-led <green|orange> <on|off|heartbeat|activity>" >&2
+}
+
+[ "${1:-}" != help ] || { usage; exit 0; }
+[ "$#" -eq 2 ] || { usage; exit 64; }
+
+case "$1" in
+	green) led=helm:green:status ;;
+	orange) led=helm:orange:activity ;;
+	*) usage; exit 64 ;;
+esac
+
+directory=/sys/class/leds/$led
+[ -d "$directory" ] || { echo "$led is not present" >&2; exit 2; }
+
+case "$2" in
+	on)
+		echo none > "$directory/trigger"
+		echo 1 > "$directory/brightness"
+		;;
+	off)
+		echo none > "$directory/trigger"
+		echo 0 > "$directory/brightness"
+		;;
+	heartbeat)
+		echo heartbeat > "$directory/trigger"
+		;;
+	activity)
+		echo disk-activity > "$directory/trigger"
+		;;
+	*) usage; exit 64 ;;
+esac

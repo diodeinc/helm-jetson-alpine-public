@@ -1,0 +1,20 @@
+# Minimal Alpine userspace plus hardware inspection and recovery utilities.
+alpine-base
+ca-certificates
+chrony
+dhcpcd
+dropbear
+e2fsprogs
+ethtool
+eudev
+eudev-openrc
+i2c-tools
+iproute2
+kmod
+libgpiod
+mkinitfs
+nvme-cli
+openrc
+pciutils
+util-linux
+usbutils

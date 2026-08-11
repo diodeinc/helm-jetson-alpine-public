@@ -1,0 +1,5 @@
+Helm / Alpine Linux
+
+The local debug UART is an intentionally privileged bring-up console.
+Run `helm-info` for board state and `helm-led help` for LED controls.
+SSH accepts keys only; install keys in /root/.ssh/authorized_keys.

@@ -1,0 +1,26 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local build trees and tool caches
+build/
+**/target/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/compile_commands.json
+
+# NVIDIA BSP and generated recovery payloads
+Linux_for_Tegra/
+Jetson_Linux_*_aarch64.tbz2
+*.img
+*.ext4
+*.zst
+*.log
+
+# Device-specific and signing material
+*ECID*
+*ecid*
+*.key
+*.pem
