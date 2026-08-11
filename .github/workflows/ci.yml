@@ -45,6 +45,7 @@ jobs:
             libarchive \
             libusb \
             pkg-config \
+            ripgrep \
             shellcheck \
             zstd
 
