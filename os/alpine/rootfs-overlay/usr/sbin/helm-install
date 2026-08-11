@@ -1,0 +1,200 @@
+#!/bin/sh
+set -eu
+
+program=${0##*/}
+default_archive=/opt/helm/payload/helm-rootfs.tar.zst
+device=
+confirm=
+archive=$default_archive
+mount_dir=/run/helm-install/root
+mounted=0
+
+usage()
+{
+	cat <<EOF
+usage:
+  $program inspect [--device /dev/nvme0n1]
+  $program install --device /dev/nvme0n1 \\
+    --confirm /dev/nvme0n1 [--archive PATH]
+
+inspect is read-only. install destroys the selected NVMe's partition table and
+filesystems. --confirm must exactly match --device.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$program" "$*" >&2
+	exit 1
+}
+
+cleanup()
+{
+	if [ "$mounted" -eq 1 ]; then
+		sync || :
+		umount "$mount_dir" || :
+		mounted=0
+	fi
+}
+
+canonical_nvme()
+{
+	candidate=$1
+	case "$candidate" in
+		/dev/nvme[0-9]n[0-9]) ;;
+		*) die "refusing non-NVMe whole-disk path: $candidate" ;;
+	esac
+	[ -b "$candidate" ] || die "not a block device: $candidate"
+	[ -e "/sys/class/block/${candidate##*/}" ] || \
+		die "device is absent from sysfs: $candidate"
+	printf '%s\n' "$candidate"
+}
+
+assert_unmounted()
+{
+	target=$1
+	while read -r source _rest; do
+		case "$source" in
+			"$target"|"$target"p[0-9]*)
+				die "$source is mounted; refusing to overwrite $target"
+				;;
+		esac
+	done < /proc/mounts
+}
+
+device_summary()
+{
+	target=$1
+	base=${target##*/}
+	sectors=$(cat "/sys/class/block/$base/size" 2>/dev/null || printf 0)
+	model=$(cat "/sys/class/block/$base/device/model" 2>/dev/null || printf unknown)
+	serial=$(cat "/sys/class/block/$base/device/serial" 2>/dev/null || printf unavailable)
+	bytes=$((sectors * 512))
+	printf 'device: %s\n' "$target"
+	printf 'model:  %s\n' "$model"
+	printf 'serial: %s\n' "$serial"
+	printf 'size:   %s bytes (%s sectors)\n' "$bytes" "$sectors"
+	if command -v lsblk >/dev/null 2>&1; then
+		lsblk -o NAME,TYPE,SIZE,FSTYPE,LABEL,MOUNTPOINTS "$target" || :
+	fi
+}
+
+inspect_all()
+{
+	found=0
+	for sys_device in /sys/class/block/nvme[0-9]n[0-9]; do
+		[ -e "$sys_device" ] || continue
+		found=1
+		device_summary "/dev/${sys_device##*/}"
+	done
+	if [ "$found" -eq 0 ]; then
+		printf 'No NVMe namespace is present.\n'
+	fi
+}
+
+command_name=${1:-}
+[ "$#" -gt 0 ] && shift
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--device)
+			[ "$#" -ge 2 ] || die "--device needs a value"
+			device=$2
+			shift 2
+			;;
+		--confirm)
+			[ "$#" -ge 2 ] || die "--confirm needs a value"
+			confirm=$2
+			shift 2
+			;;
+		--archive)
+			[ "$#" -ge 2 ] || die "--archive needs a value"
+			archive=$2
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*) die "unknown argument: $1" ;;
+	esac
+done
+
+case "$command_name" in
+	inspect)
+		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
+		if [ -n "$device" ]; then
+			device=$(canonical_nvme "$device")
+			device_summary "$device"
+		else
+			inspect_all
+		fi
+		exit 0
+		;;
+	install) ;;
+	-h|--help|help|"")
+		usage
+		exit 0
+		;;
+	*) die "unknown command: $command_name" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || die "install must run as root"
+[ -n "$device" ] || die "install requires --device"
+device=$(canonical_nvme "$device")
+[ "$confirm" = "$device" ] || \
+	die "--confirm must exactly equal $device"
+[ -s "$archive" ] || die "rootfs archive is missing or empty: $archive"
+command -v sfdisk >/dev/null 2>&1 || die "sfdisk is unavailable"
+command -v mkfs.ext4 >/dev/null 2>&1 || die "mkfs.ext4 is unavailable"
+command -v zstd >/dev/null 2>&1 || die "zstd is unavailable"
+
+sectors=$(cat "/sys/class/block/${device##*/}/size")
+[ "$sectors" -ge 4194304 ] || die "NVMe is smaller than 2 GiB"
+assert_unmounted "$device"
+
+printf 'Validating Alpine payload...\n'
+archive_listing=$(zstd -q -d -c "$archive" | tar -tf -)
+printf '%s\n' "$archive_listing" | grep -qx './sbin/init' || \
+	die "archive has no /sbin/init"
+printf '%s\n' "$archive_listing" | grep -qx './boot/Image' || \
+	die "archive has no /boot/Image"
+
+device_summary "$device"
+printf '\nDESTROYING %s and installing Helm Alpine.\n' "$device"
+trap cleanup EXIT HUP INT TERM
+
+# One GPT Linux partition is intentional: NVIDIA UEFI reads extlinux.conf and
+# the kernel directly from ext4, so an EFI System Partition is unnecessary.
+printf 'label: gpt\n, , L\n' | \
+	sfdisk --wipe always --wipe-partitions always "$device"
+partprobe "$device" || :
+udevadm settle --timeout=10 || :
+
+partition=${device}p1
+attempt=0
+while [ ! -b "$partition" ] && [ "$attempt" -lt 50 ]; do
+	attempt=$((attempt + 1))
+	sleep 0.1
+done
+[ -b "$partition" ] || die "partition did not appear: $partition"
+
+mkfs.ext4 -F -L HELM_ROOT \
+	-E lazy_itable_init=0,lazy_journal_init=0 "$partition"
+mkdir -p "$mount_dir"
+mount -t ext4 -o rw,noatime "$partition" "$mount_dir"
+mounted=1
+
+printf 'Extracting Helm Alpine to %s...\n' "$partition"
+zstd -q -d -c "$archive" | tar -xpf - -C "$mount_dir"
+[ -e "$mount_dir/sbin/init" ] || die "installed /sbin/init is missing"
+[ -s "$mount_dir/boot/Image" ] || die "installed kernel is missing"
+[ -s "$mount_dir/boot/extlinux/extlinux.conf" ] || \
+	die "installed extlinux.conf is missing"
+
+sync
+umount "$mount_dir"
+mounted=0
+trap - EXIT HUP INT TERM
+printf 'Helm Alpine installation complete on %s.\n' "$partition"
+printf 'Power off before removing the recovery cable or NVMe.\n'

@@ -2,8 +2,11 @@
 alpine-base
 ca-certificates
 chrony
+chrony-openrc
 dhcpcd
+dhcpcd-openrc
 dropbear
+dropbear-openrc
 e2fsprogs
 ethtool
 eudev
@@ -12,9 +15,14 @@ i2c-tools
 iproute2
 kmod
 libgpiod
+lsblk
 mkinitfs
+mtd-utils
 nvme-cli
 openrc
 pciutils
+sfdisk
+udev-init-scripts-openrc
 util-linux
 usbutils
+zstd

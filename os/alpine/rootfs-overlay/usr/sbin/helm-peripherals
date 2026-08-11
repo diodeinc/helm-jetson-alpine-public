@@ -13,6 +13,7 @@ set_led_trigger()
 
 # Device-tree modaliases normally load these automatically. Explicit attempts
 # make early bring-up deterministic while remaining harmless for built-ins.
+depmod -a 2>/dev/null || :
 modprobe r8168 2>/dev/null || :
 modprobe i2c-dev 2>/dev/null || :
 modprobe pwm-tegra-tachometer 2>/dev/null || :

@@ -1,99 +1,112 @@
 # Helm Alpine Linux
 
-This builds a small Alpine Linux 3.24 aarch64 system for the Diode Helm
-carrier and NVIDIA Jetson Orin NX/Nano modules. It combines Alpine userspace
-with NVIDIA's Jetson Linux 39.2 kernel, out-of-tree modules, firmware, and
-per-SKU device trees.
+This directory builds Alpine Linux 3.24 for the Diode Helm carrier and NVIDIA
+Jetson Orin NX/Nano modules. The primary profile is Orin NX 8 GB
+(`P3767-0001`) with the Jetson Linux R39.2 6.8.12-tegra kernel.
 
-The build runs natively on Apple silicon through Docker Desktop. It does not
-flash, reset, or otherwise communicate with a Helm connected in recovery mode.
+The build runs directly on Apple-silicon macOS. It does not start a container
+or VM, run an NVIDIA host executable, access USB, or write target storage.
 
-## What is included
+## Included system
 
-- OpenRC, DHCP, chrony, key-only Dropbear SSH, eudev, and a serial console
-- NVIDIA 6.8.12-tegra kernel, modules, firmware, and an NVMe-capable initramfs
-- C4 x4 NVMe and the module's C8 PCIe Realtek GbE PHY (`r8168`)
-- USB2 recovery/device mode plus both Helm USB 3 host ports
-- PWM fan and tachometer support through the kernel thermal framework
+- OpenRC, DHCP, chrony, key-only Dropbear, eudev, and a debug serial console
+- NVIDIA kernel, in-tree/out-of-tree modules, and target firmware
+- NVMe-capable normal and recovery initramfs images
+- C4 x4 NVMe and C8 PCIe Realtek GbE (`r8168`)
+- USB2 recovery/device mode and both Helm USB 3 host ports
+- PWM fan/tachometer kernel support
 - green heartbeat and orange disk-activity/panic GPIO LEDs
-- I2C, GPIO, USB, PCIe, NVMe, and network inspection tools
-- full DTBs for every P3767 SKU plus a firmware-selected dynamic overlay
+- I2C, GPIO, USB, PCIe, NVMe, MTD, and network inspection tools
+- full Helm DTBs for P3767 SKUs 0000, 0001, 0003, 0004, and 0005
+- guarded target-side NVMe and QSPI installers
 
-This deliberately omits a desktop, container runtime, CUDA, and NVIDIA's
-glibc-only graphics/compute userland. Alpine is a strong fit for a small,
-appliance-style OS; use an NVIDIA Ubuntu container or a separate glibc layer
-later if CUDA is required.
+The image deliberately omits a desktop, container runtime, CUDA, and NVIDIA's
+glibc graphics/compute userspace.
 
-## Build on macOS
+## Build
 
-Requirements:
+```sh
+brew install apko cpio dtc libarchive zstd
+mkdir -p build/downloads
+# Place Jetson_Linux_R39.2.0_aarch64.tbz2 in build/downloads.
+./os/alpine/build.sh
+```
 
-- Apple-silicon Mac
-- Docker Desktop with its Linux engine running
-- `Jetson_Linux_R39.2.0_aarch64.tbz2` from NVIDIA
-
-Place the BSP archive at
-`build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2`, or provide another path:
+Use another BSP location when needed:
 
 ```sh
 HELM_L4T_ARCHIVE=/absolute/path/Jetson_Linux_R39.2.0_aarch64.tbz2 \
   ./os/alpine/build.sh
 ```
 
-To enable remote root login, inject an SSH public-key file at build time:
+To enable remote root login, inject an SSH public-key file:
 
 ```sh
-HELM_SSH_AUTHORIZED_KEYS_FILE="$HOME/.ssh/authorized_keys" \
+HELM_SSH_AUTHORIZED_KEYS_FILE=/absolute/path/to/authorized_keys \
   ./os/alpine/build.sh
 ```
 
-The debug UART is intentionally a passwordless root bring-up console. SSH is
-key-only. A build without an injected key therefore has no remote login.
-
-Set `HELM_ROOTFS_SIZE` if the default 2 GiB APP filesystem is too small:
-
-```sh
-HELM_ROOTFS_SIZE=8G ./os/alpine/build.sh
-```
+The debug UART remains a passwordless root bring-up console. SSH is key-only;
+a build without an injected key has no remote login.
 
 ## Artifacts
 
-Build products are written to `build/helm-alpine/out/`:
+The native outputs are under `build/helm-alpine-native/out/`:
 
-- `*-rootfs.ext4.zst`: compressed APP-partition filesystem image
-- `*-rootfs.tar.zst`: root filesystem archive for image assembly
-- `*-boot.tar.zst`: kernel, initramfs, extlinux menu, overlay, and full DTBs
-- `SHA256SUMS`: checksums for the three distributable archives/images
-- `packages.txt`, `helm-release`, and `ext4-info.txt`: build manifests
+- `*-rootfs.tar.zst`: root-owned Alpine filesystem installed onto NVMe
+- `*-boot.tar.zst`: kernel, normal initramfs, extlinux menu, and Helm DTBs
+- `*-initramfs.gz`: normal `HELM_ROOT` discovery and switch-root initramfs
+- `*-recovery-initramfs.gz`: base RAM recovery with the embedded OS payload
+- `*-recovery-boot.img`: base T234-compatible Android boot image for RCM
+- `SHA256SUMS`, `packages.txt`, and `helm-release`: integrity and build manifests
 
-The uncompressed `*.ext4` is retained for local inspection and for conversion
-to NVIDIA's sparse APP image format. It is a partition image, not a complete
-NVMe disk image.
+There is intentionally no host-generated ext4 disk image. The RAM-booted
+Jetson creates GPT/ext4 itself, which preserves Linux ownership and removes
+the need for a privileged Linux image builder on the Mac.
 
-## Boot and deployment boundary
+## Recovery installers
 
-The attached recovery device reports NVIDIA USB ID `0955:7423`. NVIDIA's R39.2
-recovery table identifies that as Orin NX 8GB (`P3767-0001`), so this build
-defaults to its exact full Helm DTB. The extlinux menu also includes full DTBs
-for `P3767-0000`, `-0003`, `-0004`, and `-0005`; `helm-auto` retains firmware
-SKU selection and applies the carrier overlay dynamically if the image is
-reused on another module.
+Recovery boots to a serial shell without writing anything. Inspect first:
 
-Jetson's QSPI/UEFI, MB1 configuration, partition layout, and signed recovery
-payload still use NVIDIA's official tooling. This Alpine builder never writes
-storage. On Apple-silicon macOS,
-`tools/tegraflash-macos/helm-flash prepare` can use the BSP to assemble the
-sparse APP image and signed recovery payloads without attaching USB. The live
-write path remains an explicit, experimental NVIDIA flash invocation through
-the native bridge and is intentionally not automated; see the macOS recovery
-guide before using it. Do not write `*-rootfs.ext4` to an entire NVMe device;
-it is only the APP filesystem.
+```sh
+helm-install inspect
+```
 
-No storage is written unless a separate, explicit flashing command is run.
+After installing an NVMe, run the destructive action with exact confirmation:
+
+```sh
+helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1
+```
+
+The installer validates its embedded archive, refuses mounted/non-NVMe/small
+targets, writes one GPT Linux partition, formats it as ext4 with label
+`HELM_ROOT`, extracts Alpine, validates the kernel/init/extlinux files, syncs,
+and unmounts. NVIDIA UEFI can load extlinux and the kernel directly from that
+ext4 filesystem, so this layout needs no separate EFI System Partition.
+
+`helm-install` never writes `/dev/mtd0` or QSPI. The native `helm-macos bundle`
+step augments this base recovery image with a fixed 64 MiB QSPI image and the
+separate `helm-qspi-install` command. After the NVMe install succeeds, mount
+it so the QSPI backup lands on persistent storage:
+
+```sh
+mkdir -p /mnt/helm-root
+mount /dev/nvme0n1p1 /mnt/helm-root
+helm-qspi-install inspect
+helm-qspi-install install --device /dev/mtd0 \
+  --backup /mnt/helm-root/root/qspi-before.img \
+  --confirm helm-orin-nx-8gb-r39.2
+```
+
+The QSPI installer checks the exact 64 MiB/64 KiB MTD geometry and image
+checksum, requires an unused backup path on a mounted block filesystem, backs
+up the complete device, uses `flashcp`, and verifies a full readback. It is a
+destructive bring-up path whose first physical write and cold boot have not
+yet been qualified.
 
 ## First boot
 
-Connect the onboard MCP2221 debug USB serial adapter at 115200 8N1. After boot:
+Connect the onboard MCP2221 debug UART at 115200 8N1. After boot:
 
 ```sh
 helm-info
@@ -102,5 +115,7 @@ helm-led orange activity
 cat /run/helm-peripherals
 ```
 
-The default hostname is `helm`. `dhcpcd` requests an address on available
-interfaces, the green LED heartbeats, and the orange LED tracks disk activity.
+The `helm-peripherals` OpenRC service regenerates module dependencies, loads
+carrier drivers, initializes GPIO LED triggers, and records detected GPIO,
+NVMe, LED, and thermal devices. The default hostname is `helm`; `dhcpcd`
+requests an address on available interfaces.

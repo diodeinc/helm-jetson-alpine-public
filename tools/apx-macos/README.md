@@ -39,12 +39,13 @@ build/macos-tools/bin/apxctl cid --pid 0x7423 --consume-greeting
 
 After that command, re-enter recovery mode before running another RCM client.
 
-## NVIDIA tool boundary
+## Recovery transport boundary
 
 NVIDIA's current Orin host package includes `tegraflash_impl_t234.py` and
 `tegrasign_v3.py`, but its T234 implementations of `tegrarcm_v2`,
 `tegrahost_v2`, `tegraparser_v2`, and `tegrabct_v2` are prebuilt 32-bit Linux
-ELF executables. The public `NVIDIA/tegrarcm` source predates T234. Therefore
-`apxctl` provides the native macOS USB transport and safe diagnostics, but it
-does not claim to be a drop-in implementation of NVIDIA's closed Orin signing,
-BCT generation, and flash protocol.
+ELF executables. The public `NVIDIA/tegrarcm` source predates T234. `apxctl`
+deliberately remains the read-only diagnostic tool; volatile T234 RAM boot is
+handled by the pinned native libusb loader in
+[`diodeinc/t234-bootkit`](https://github.com/diodeinc/t234-bootkit) and the
+orchestration under `tools/helm-macos`.

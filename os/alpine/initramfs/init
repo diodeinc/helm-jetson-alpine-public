@@ -1,0 +1,93 @@
+#!/bin/busybox sh
+
+set -u
+
+bb=/bin/busybox
+export PATH=/bin:/sbin
+
+log()
+{
+	printf 'helm-initramfs: %s\n' "$*" > /dev/console
+}
+
+emergency_shell()
+{
+	log "$1"
+	log "dropping to an emergency shell"
+	exec "$bb" sh < /dev/console > /dev/console 2>&1
+}
+
+mkdir -p /dev /dev/pts /proc /sys /run /newroot
+"$bb" mount -t devtmpfs devtmpfs /dev || emergency_shell "cannot mount devtmpfs"
+"$bb" mount -t devpts devpts /dev/pts || :
+"$bb" mount -t proc proc /proc || emergency_shell "cannot mount proc"
+"$bb" mount -t sysfs sysfs /sys || emergency_shell "cannot mount sysfs"
+"$bb" mount -t tmpfs tmpfs /run || emergency_shell "cannot mount /run"
+
+kernel_release=$("$bb" uname -r)
+module_dir=/lib/modules/$kernel_release
+
+load_module()
+{
+	name=$1
+	module=$("$bb" find "$module_dir" -type f -name "$name.ko" 2>/dev/null | "$bb" head -n 1)
+	if [ -n "$module" ]; then
+		"$bb" insmod "$module" 2>/dev/null || :
+	fi
+}
+
+# C4 NVMe requires the Tegra P2U PHY and PCIe root-port drivers before the
+# generic NVMe host driver. Built-in components harmlessly produce no match.
+for module in phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+	load_module "$module"
+done
+
+root_spec=LABEL=HELM_ROOT
+for argument in $(cat /proc/cmdline); do
+	case "$argument" in
+		root=*) root_spec=${argument#root=} ;;
+	esac
+done
+
+resolve_root()
+{
+	case "$root_spec" in
+		LABEL=*)
+			label=${root_spec#LABEL=}
+			for device in /dev/nvme*n*p* /dev/mmcblk*p* /dev/sd*; do
+				[ -b "$device" ] || continue
+				case $("$bb" blkid "$device" 2>/dev/null || :) in
+					*"LABEL=\"$label\""*) printf '%s\n' "$device"; return 0 ;;
+				esac
+			done
+			return 1
+			;;
+		/dev/*)
+			[ -b "$root_spec" ] || return 1
+			printf '%s\n' "$root_spec"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+root_device=
+attempt=0
+while [ "$attempt" -lt 60 ]; do
+	root_device=$(resolve_root || :)
+	[ -n "$root_device" ] && break
+	attempt=$((attempt + 1))
+	"$bb" sleep 1
+done
+
+[ -n "$root_device" ] || emergency_shell "root device $root_spec did not appear"
+log "mounting $root_device"
+"$bb" mount -t ext4 -o rw,noatime "$root_device" /newroot || \
+	emergency_shell "cannot mount $root_device"
+
+mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
+"$bb" mount -o move /dev /newroot/dev
+"$bb" mount -o move /proc /newroot/proc
+"$bb" mount -o move /sys /newroot/sys
+"$bb" mount -o move /run /newroot/run
+
+exec "$bb" switch_root /newroot /sbin/init

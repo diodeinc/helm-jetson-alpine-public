@@ -1,4 +1,4 @@
-name: CI
+name: Native macOS CI
 
 on:
   push:
@@ -18,49 +18,80 @@ defaults:
   run:
     shell: bash
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  source-checks:
-    name: Source checks (Linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+  macos-native:
+    name: Apple-silicon source and image checks
+    runs-on: macos-15
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Install system dependencies
+      - name: Verify native host
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+
+      - name: Install native dependencies
+        run: |
+          brew install \
+            actionlint \
+            apko \
             cmake \
-            device-tree-compiler \
-            libusb-1.0-0-dev \
+            cpio \
+            dtc \
+            libarchive \
+            libusb \
             pkg-config \
-            ripgrep \
-            shellcheck
+            shellcheck \
+            zstd
 
-      - name: Install stable Rust
+      - name: Validate workflow and source
         run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component rustfmt \
-            --no-self-update
-          rustup default stable
+          actionlint
+          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh)' os tools \
+            | xargs -0 -n 1 sh -n
+          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh)' os tools \
+            | xargs -0 shellcheck --shell=sh --severity=warning
+          python3 -m py_compile \
+            tools/helm-macos/build-rcm-blob.py \
+            tools/helm-macos/mkbootimg.py
+          tools/helm-macos/build-rcm-blob.py --self-test
+          os/alpine/rootfs-overlay/usr/sbin/helm-install --help >/dev/null
+          os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install --help >/dev/null
+          test "$(shasum tools/helm-macos/profile-data/r39.2/qspi_bootblob_ver.txt \
+            | awk '{print $1}')" = \
+            91272c6e6bda545bb804856a093eb57168cda3ca
 
-      - name: Validate shell scripts
+      - name: Test native Android boot-image builder
         run: |
-          mapfile -t scripts < <(rg -l '^#!' os tools --glob '!**/target/**')
-          test "${#scripts[@]}" -gt 0
-          for script in "${scripts[@]}"; do
-            sh -n "$script"
-          done
-          shellcheck --shell=sh --severity=warning "${scripts[@]}"
+          work=$(mktemp -d "${TMPDIR}/helm-bootimg.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          printf 'kernel-fixture' > "$work/Image"
+          printf 'ramdisk-fixture' > "$work/initramfs.gz"
+          tools/helm-macos/mkbootimg.py \
+            --kernel "$work/Image" \
+            --ramdisk "$work/initramfs.gz" \
+            --output "$work/boot.img"
+          test "$(dd if="$work/boot.img" bs=8 count=1 2>/dev/null)" = 'ANDROID!'
+          file "$work/boot.img" | grep -q 'Android bootimg'
 
-      - name: Compile device-tree overlay
+      - name: Resolve Alpine arm64 userspace natively
+        run: |
+          mkdir -p build
+          apko build-minirootfs \
+            --build-arch arm64 \
+            os/alpine/apko.yaml \
+            build/ci-rootfs.tar.gz
+          archive_tool="$(brew --prefix libarchive)/bin/bsdtar"
+          "$archive_tool" -tf build/ci-rootfs.tar.gz > build/ci-rootfs.list
+          grep -qx 'sbin/init' build/ci-rootfs.list
+          grep -qx 'sbin/sfdisk' build/ci-rootfs.list
+          grep -qx 'usr/bin/zstd' build/ci-rootfs.list
+
+      - name: Compile Helm device-tree overlay
         run: |
           mkdir -p build/ci-device-tree
           dtc -@ -I dts -O dtb \
@@ -68,51 +99,8 @@ jobs:
             os/alpine/device-tree/helm-p3768.dtso
           test -s build/ci-device-tree/helm-p3768.dtbo
 
-      - name: Check and test Rust bridge
-        run: |
-          cargo fmt \
-            --manifest-path tools/tegraflash-macos/Cargo.toml \
-            --check
-          cargo test \
-            --locked \
-            --manifest-path tools/tegraflash-macos/Cargo.toml
-
-      - name: Build and test APX tools
-        run: |
-          cmake \
-            -S tools/apx-macos \
-            -B build/ci-apx \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build/ci-apx --parallel 2
-          ctest --test-dir build/ci-apx --output-on-failure
-
-  macos-native:
-    name: Native tools (Apple silicon)
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Verify Apple silicon runner
-        run: test "$(uname -m)" = arm64
-
-      - name: Install system dependencies
-        run: brew install cmake libusb pkg-config
-
-      - name: Install stable Rust
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component rustfmt \
-            --no-self-update
-          rustup default stable
-
-      - name: Build and test native tools
+      - name: Build and test native APX tools
         run: |
           ./tools/apx-macos/build.sh
-          ./tools/tegraflash-macos/build.sh native
           build/macos-tools/bin/apxctl --help >/dev/null
-          build/macos-tools/bin/helm-apx-bridge --help >/dev/null
+          file build/macos-tools/bin/apxctl | grep -q 'Mach-O 64-bit executable arm64'

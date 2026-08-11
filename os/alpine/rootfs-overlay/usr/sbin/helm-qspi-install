@@ -1,0 +1,184 @@
+#!/bin/sh
+set -eu
+
+program=${0##*/}
+profile=helm-orin-nx-8gb-r39.2
+device=/dev/mtd0
+device_set=0
+image=/opt/helm/payload/helm-qspi.img
+checksum=/opt/helm/payload/helm-qspi.img.sha256
+backup=
+confirm=
+expected_size=67108864
+expected_erase_size=65536
+
+usage()
+{
+	cat <<EOF
+usage:
+  $program inspect [--device /dev/mtd0]
+  $program install --device /dev/mtd0 --backup /mounted/path/qspi-before.img \\
+    --confirm $profile
+
+install erases and rewrites the complete 64 MiB QSPI. It requires a backup on
+a mounted block filesystem and exact profile confirmation.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$program" "$*" >&2
+	exit 1
+}
+
+canonical_mtd()
+{
+	candidate=$1
+	case "$candidate" in
+		/dev/mtd[0-9]) ;;
+		*) die "refusing non-MTD path: $candidate" ;;
+	esac
+	[ -c "$candidate" ] || die "not a character device: $candidate"
+	[ -d "/sys/class/mtd/${candidate##*/}" ] || \
+		die "device is absent from sysfs: $candidate"
+	printf '%s\n' "$candidate"
+}
+
+geometry()
+{
+	base=${device##*/}
+	actual_size=$(cat "/sys/class/mtd/$base/size")
+	actual_erase_size=$(cat "/sys/class/mtd/$base/erasesize")
+	printf 'profile:    %s\n' "$profile"
+	printf 'device:     %s\n' "$device"
+	printf 'size:       %s bytes\n' "$actual_size"
+	printf 'erase size: %s bytes\n' "$actual_erase_size"
+}
+
+validate_geometry()
+{
+	base=${device##*/}
+	actual_size=$(cat "/sys/class/mtd/$base/size")
+	actual_erase_size=$(cat "/sys/class/mtd/$base/erasesize")
+	[ "$actual_size" -eq "$expected_size" ] || \
+		die "MTD size is $actual_size, expected $expected_size"
+	[ "$actual_erase_size" -eq "$expected_erase_size" ] || \
+		die "erase size is $actual_erase_size, expected $expected_erase_size"
+}
+
+validate_image()
+{
+	[ -s "$image" ] || die "QSPI image is missing: $image"
+	[ -s "$checksum" ] || die "QSPI checksum is missing: $checksum"
+	image_size=$(wc -c < "$image" | tr -d ' ')
+	[ "$image_size" -eq "$expected_size" ] || \
+		die "QSPI image size is $image_size, expected $expected_size"
+	expected_sha=$(awk 'NR == 1 { print $1 }' "$checksum")
+	actual_sha=$(sha256sum "$image" | awk '{ print $1 }')
+	[ "$actual_sha" = "$expected_sha" ] || die "QSPI image checksum mismatch"
+}
+
+command_name=${1:-}
+[ "$#" -gt 0 ] && shift
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--device)
+			[ "$#" -ge 2 ] || die "--device needs a value"
+			device=$2
+			device_set=1
+			shift 2
+			;;
+		--backup)
+			[ "$#" -ge 2 ] || die "--backup needs a value"
+			backup=$2
+			shift 2
+			;;
+		--confirm)
+			[ "$#" -ge 2 ] || die "--confirm needs a value"
+			confirm=$2
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*) die "unknown argument: $1" ;;
+	esac
+done
+
+case "$command_name" in
+	inspect)
+		[ -z "$backup" ] || die "--backup is invalid with inspect"
+		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
+		device=$(canonical_mtd "$device")
+		geometry
+		validate_geometry
+		validate_image
+		printf 'image:      %s\n' "$image"
+		printf 'image SHA:  %s\n' "$actual_sha"
+		printf 'No QSPI data was written.\n'
+		exit 0
+		;;
+	install) ;;
+	-h|--help|help|"")
+		usage
+		exit 0
+		;;
+	*) die "unknown command: $command_name" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || die "install must run as root"
+[ "$device_set" -eq 1 ] || die "install requires --device"
+device=$(canonical_mtd "$device")
+[ "$confirm" = "$profile" ] || die "--confirm must exactly equal $profile"
+[ -n "$backup" ] || die "install requires --backup"
+case "$backup" in
+	/*) ;;
+	*) die "--backup must be an absolute path" ;;
+esac
+case "$backup" in
+	/dev/*|/proc/*|/run/*|/sys/*|/tmp/*)
+		die "backup must be on persistent mounted storage"
+		;;
+esac
+if [ -e "$backup" ] || [ -L "$backup" ]; then
+	die "refusing to overwrite backup: $backup"
+fi
+backup_parent=${backup%/*}
+[ -n "$backup_parent" ] || backup_parent=/
+[ -d "$backup_parent" ] || die "backup directory does not exist: $backup_parent"
+backup_fs=$(df -P "$backup_parent" | awk 'NR == 2 { print $1 }')
+case "$backup_fs" in
+	/dev/*) ;;
+	*) die "backup directory is not on a mounted block device: $backup_parent" ;;
+esac
+backup_available_kib=$(df -Pk "$backup_parent" | awk 'NR == 2 { print $4 }')
+case "$backup_available_kib" in
+	''|*[!0-9]*) die "cannot determine free space for QSPI backup" ;;
+esac
+[ "$backup_available_kib" -ge 65536 ] || \
+	die "backup filesystem has less than 64 MiB free"
+
+command -v flashcp >/dev/null 2>&1 || die "flashcp is unavailable"
+validate_geometry
+validate_image
+geometry
+printf 'image SHA:  %s\n' "$actual_sha"
+printf '\nBacking up all QSPI to %s before destructive write...\n' "$backup"
+umask 077
+dd if="$device" of="$backup" bs=1048576 count=64 conv=fsync
+backup_size=$(wc -c < "$backup" | tr -d ' ')
+[ "$backup_size" -eq "$expected_size" ] || die "QSPI backup is incomplete"
+backup_sha=$(sha256sum "$backup" | awk '{ print $1 }')
+printf '%s  %s\n' "$backup_sha" "${backup##*/}" > "$backup.sha256"
+sync
+
+printf '\nERASING AND WRITING COMPLETE QSPI. DO NOT REMOVE POWER.\n'
+flashcp -v "$image" "$device"
+readback_sha=$(dd if="$device" bs=1048576 count=64 2>/dev/null | \
+	sha256sum | awk '{ print $1 }')
+[ "$readback_sha" = "$actual_sha" ] || die "full QSPI readback checksum mismatch"
+sync
+printf 'QSPI installation and full readback verification succeeded.\n'
+printf 'Backup SHA-256: %s\n' "$backup_sha"
+printf 'Power off cleanly, then remove force-recovery and cold boot.\n'

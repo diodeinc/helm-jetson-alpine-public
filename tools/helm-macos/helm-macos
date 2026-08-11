@@ -1,0 +1,365 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+build_dir=${HELM_MACOS_BUILD_DIR:-"$repo_dir/build/helm-macos"}
+alpine_build_dir=${HELM_ALPINE_BUILD_DIR:-"$repo_dir/build/helm-alpine-native"}
+signed_dir=${HELM_R39_SIGNED_DIR:-"$repo_dir/build/inputs/r39.2-signed"}
+bundle_dir=${HELM_RCM_BUNDLE_DIR:-"$build_dir/rcm-r39.2-p3767-0001"}
+qspi_dir=$build_dir/qspi-r39.2-p3767-0001
+qspi_catalog=$qspi_dir/catalog
+qspi_image=$qspi_dir/helm-qspi.img
+provision_dir=$build_dir/work/provisioning-initramfs
+provision_initramfs=$build_dir/helm-provisioning-initramfs.gz
+provision_boot=$build_dir/helm-provisioning-boot.img
+stage_dir=$build_dir/work/rcm-stage
+bootkit_dir=${HELM_T234_BOOTKIT_DIR:-"$repo_dir/../t234-bootkit"}
+loader=$bootkit_dir/macos-rcm/jetson-rcm
+bootkit_commit=5cedc336c859a2561644475aef057feaf41e73c0
+
+usage()
+{
+	cat <<EOF
+usage: $0 COMMAND
+
+Native Apple-silicon macOS commands:
+  doctor      check host tools, fixed-profile inputs, and APX presence
+  bootstrap   clone and build the pinned native t234-bootkit loader
+  build       build APX tools, Alpine, recovery initramfs, and boot image
+  qspi        build and verify the fixed 64 MiB QSPI image (no device access)
+  bundle      embed QSPI/NVMe installers and verify the native RCM bundle
+  all         run build followed by bundle
+  probe       inspect the attached T234 recovery interface (read-only)
+  verify      verify the six-file RCM bundle (read-only)
+  boot        volatile RAM-boot the recovery installer (does not write storage)
+  install-help show the guarded command to run on the Jetson recovery console
+
+No command here runs Docker, a VM, or an NVIDIA host executable. The bundle
+uses fixed P3767-0001/Helm signed firmware data from HELM_R39_SIGNED_DIR.
+EOF
+}
+
+die()
+{
+	printf 'helm-macos: %s\n' "$*" >&2
+	exit 1
+}
+
+need_command()
+{
+	command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+need_file()
+{
+	[ -s "$1" ] || die "missing required file: $1"
+}
+
+require_macos()
+{
+	[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || \
+		die "this workflow requires Apple-silicon macOS"
+}
+
+clean_directory()
+{
+	directory=$1
+	case "$directory" in
+		"$qspi_dir"|"$provision_dir"|"$stage_dir"|"$bundle_dir") ;;
+		*) die "refusing to clean unexpected directory: $directory" ;;
+	esac
+	mkdir -p "$directory"
+	find "$directory" -mindepth 1 -delete
+}
+
+build_bootkit()
+{
+	need_file "$bootkit_dir/macos-rcm/src/jetson_rcm.c"
+	make -C "$bootkit_dir/macos-rcm"
+	need_file "$loader"
+}
+
+bootstrap()
+{
+	require_macos
+	need_command gh
+	need_command make
+	need_command pkg-config
+	if [ ! -d "$bootkit_dir/.git" ]; then
+		mkdir -p "$(dirname "$bootkit_dir")"
+		gh repo clone diodeinc/t234-bootkit "$bootkit_dir"
+	fi
+	if ! git -C "$bootkit_dir" cat-file -e "$bootkit_commit^{commit}" 2>/dev/null; then
+		die "t234-bootkit does not contain pinned commit $bootkit_commit"
+	fi
+	current=$(git -C "$bootkit_dir" rev-parse HEAD)
+	if [ "$current" != "$bootkit_commit" ]; then
+		printf 'warning: t234-bootkit HEAD is %s; validated pin is %s\n' \
+			"$current" "$bootkit_commit" >&2
+	fi
+	build_bootkit
+}
+
+doctor()
+{
+	require_macos
+	failures=0
+	for command in apko brew cmake cpio dtc fdtoverlay make pkg-config python3 shasum zstd; do
+		if command -v "$command" >/dev/null 2>&1; then
+			printf 'ok    %s\n' "$command"
+		else
+			printf 'ERROR missing command: %s\n' "$command"
+			failures=$((failures + 1))
+		fi
+	done
+	if [ -s "${HELM_L4T_ARCHIVE:-$repo_dir/build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2}" ]; then
+		printf 'ok    Jetson Linux R39.2 BSP archive\n'
+	else
+		printf 'ERROR Jetson Linux R39.2 BSP archive\n'
+		failures=$((failures + 1))
+	fi
+	if [ -d "$signed_dir" ]; then
+		printf 'ok    fixed-profile signed input directory: %s\n' "$signed_dir"
+	else
+		printf 'note  signed input directory is not staged: %s\n' "$signed_dir"
+	fi
+	if [ -x "$loader" ]; then
+		printf 'ok    native T234 RCM loader\n'
+	else
+		printf 'note  native loader is not built (run: %s bootstrap)\n' "$0"
+	fi
+	if [ -x "$loader" ] && "$loader" probe >/dev/null 2>&1; then
+		printf 'ok    one T234 APX device is attached\n'
+	else
+		printf 'note  no claimable T234 APX device is currently attached\n'
+	fi
+	[ "$failures" -eq 0 ]
+}
+
+build_all()
+{
+	require_macos
+	"$repo_dir/tools/apx-macos/build.sh"
+	HELM_ALPINE_BUILD_DIR=$alpine_build_dir "$repo_dir/os/alpine/build.sh"
+	build_bootkit
+}
+
+copy_payload()
+{
+	name=$1
+	need_file "$signed_dir/$name"
+	cp -p "$signed_dir/$name" "$stage_dir/$name"
+}
+
+build_qspi()
+{
+	require_macos
+	need_file "$bootkit_dir/tools/import-nvidia-flash-index.py"
+	need_file "$bootkit_dir/tools/qspi-flash.py"
+	need_file "$signed_dir/flash.idx"
+	signed_parent=$(CDPATH='' cd -- "$signed_dir/.." && pwd)
+	need_file "$signed_parent/secureflash.xml"
+	clean_directory "$qspi_dir"
+
+	python3 "$bootkit_dir/tools/import-nvidia-flash-index.py" \
+		"$signed_dir/flash.idx" \
+		"$signed_dir" \
+		"$qspi_catalog" \
+		--fallback-images "$script_dir/profile-data/r39.2" \
+		--fallback-images "$signed_parent" \
+		--profile helm-orin-nx-8gb-r39.2 \
+		--bsp-release R39.2 \
+		--board "P3767-0001 Orin NX 8GB, Helm carrier" \
+		--device 3:0 \
+		--expected-size 0x4000000 \
+		--erase-block-size 65536 \
+		--oracle "$signed_dir/flash.xml.bin" \
+		--oracle "$signed_dir/flash.xml.tmp" \
+		--oracle "$signed_parent/secureflash.xml"
+
+	python3 "$bootkit_dir/tools/qspi-flash.py" "$qspi_catalog/manifest.json"
+	(
+		cd "$qspi_catalog"
+		shasum -a 256 -c SHA256SUMS
+	)
+	python3 "$bootkit_dir/tools/qspi-flash.py" \
+		"$qspi_catalog/manifest.json" \
+		--build-image "$qspi_image"
+	(
+		cd "$qspi_dir"
+		shasum -a 256 -c helm-qspi.img.sha256
+	)
+}
+
+build_provisioning_boot()
+{
+	recovery_source=$alpine_build_dir/work/recovery-initramfs
+	need_file "$recovery_source/init"
+	need_file "$alpine_build_dir/work/rootfs/boot/Image"
+	clean_directory "$provision_dir"
+	cp -a "$recovery_source/." "$provision_dir/"
+	install -m 0755 \
+		"$repo_dir/os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install" \
+		"$provision_dir/usr/sbin/helm-qspi-install"
+	install -m 0644 "$qspi_image" \
+		"$provision_dir/opt/helm/payload/helm-qspi.img"
+	install -m 0644 "$qspi_catalog/manifest.json" \
+		"$provision_dir/opt/helm/payload/helm-qspi-manifest.json"
+	(
+		cd "$provision_dir/opt/helm/payload"
+		shasum -a 256 helm-qspi.img > helm-qspi.img.sha256
+	)
+
+	spi_module=$(find "$provision_dir/lib/modules" \
+		-type f -name spi-tegra210-quad.ko -print | head -n 1)
+	[ -n "$spi_module" ] || die "recovery initramfs has no Tegra QSPI driver"
+	cpio_tool=$(brew --prefix cpio)/bin/cpio
+	need_file "$cpio_tool"
+	export COPYFILE_DISABLE=1
+	(
+		cd "$provision_dir"
+		find . -print | LC_ALL=C sort | \
+			"$cpio_tool" --quiet --create --format=newc --owner=0:0 | \
+			gzip -n -9 > "$provision_initramfs"
+	)
+	python3 "$script_dir/mkbootimg.py" \
+		--kernel "$alpine_build_dir/work/rootfs/boot/Image" \
+		--ramdisk "$provision_initramfs" \
+		--cmdline "rdinit=/init rw console=ttyTCU0,115200 console=tty0 firmware_class.path=/lib/firmware pci=pcie_bus_perf nvme.use_threaded_interrupts=1" \
+		--output "$provision_boot"
+}
+
+bundle()
+{
+	require_macos
+	build_bootkit
+	build_qspi
+	build_provisioning_boot
+	clean_directory "$stage_dir"
+	clean_directory "$bundle_dir"
+
+	for name in \
+		uefi_t23x_general_with_dtb_sigheader.bin.encrypt \
+		pscfw_t234_prod_sigheader.bin.encrypt \
+		mce_flash_o10_cr_prod_sigheader.bin.encrypt \
+		tsec_t234_sigheader.bin.encrypt \
+		applet_t234_sigheader.bin.encrypt \
+		mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt \
+		xusb_t234_prod_sigheader.bin.encrypt \
+		nvpva_020_sigheader.fw.encrypt \
+		display-t234-dce_with_kernel_tegra234-p3768-0000+p3767-0001-nv_sigheader.bin.encrypt \
+		nvdec_t234_prod_sigheader.fw.encrypt \
+		bpmp_t234-TE980M-A1_prod_sigheader.bin.encrypt \
+		tegra234-bpmp-3767-0001-3509-a02_with_odm_sigheader.dtb.encrypt \
+		camera-rtcpu-t234-rce_sigheader.img.encrypt \
+		adsp-fw_sigheader.bin.encrypt \
+		spe_t234_sigheader.bin.encrypt \
+		tos-optee_t234_sigheader.img.encrypt \
+		eks_t234_sigheader.img.encrypt
+	do
+		copy_payload "$name"
+	done
+
+	need_file "$provision_boot"
+	cp -p "$provision_boot" "$stage_dir/helm-recovery-boot.img"
+	helm_dtb=$alpine_build_dir/work/rootfs/boot/dtb/helm-p3767-0001.dtb
+	need_file "$helm_dtb"
+	cp -p "$helm_dtb" "$stage_dir/helm-p3767-0001.dtb"
+
+	python3 "$script_dir/build-rcm-blob.py" \
+		"$script_dir/r39.2-rcm-blob.xml" \
+		"$stage_dir" \
+		"$bundle_dir/blob.bin"
+
+	for name in \
+		br_bct_BR.bct \
+		mb1_t234_prod_aligned_sigheader.bin.encrypt \
+		psc_bl1_t234_prod_aligned_sigheader.bin.encrypt \
+		mb1_bct_MB1_sigheader.bct.encrypt \
+		mem_rcm_sigheader.bct.encrypt
+	do
+		need_file "$signed_dir/$name"
+		cp -p "$signed_dir/$name" "$bundle_dir/$name"
+	done
+
+	cat > "$bundle_dir/PROFILE" <<EOF
+PROFILE=helm-p3767-0001-r39.2-ram-recovery
+BSP_RELEASE=39.2
+BOARD=P3767-0001
+CARRIER=Diode_Helm
+SIGNING=zerosbk
+HOST_BUILD=macos-native
+HOST_BOOT_PERSISTENT_WRITE=none
+TARGET_INSTALLERS=guarded-nvme-and-qspi
+QSPI_PROFILE=helm-orin-nx-8gb-r39.2
+EOF
+	(
+		cd "$bundle_dir"
+		shasum -a 256 \
+			br_bct_BR.bct \
+			mb1_t234_prod_aligned_sigheader.bin.encrypt \
+			psc_bl1_t234_prod_aligned_sigheader.bin.encrypt \
+			mb1_bct_MB1_sigheader.bct.encrypt \
+			mem_rcm_sigheader.bct.encrypt \
+			blob.bin > SHA256SUMS
+	)
+	verify
+	printf 'Native R39.2 RAM-recovery bundle: %s\n' "$bundle_dir"
+}
+
+verify()
+{
+	build_bootkit
+	need_file "$bundle_dir/SHA256SUMS"
+	(
+		cd "$bundle_dir"
+		shasum -a 256 -c SHA256SUMS
+	)
+	"$loader" verify "$bundle_dir"
+}
+
+command_name=${1:-}
+case "$command_name" in
+	doctor) doctor ;;
+	bootstrap) bootstrap ;;
+	build) build_all ;;
+	qspi) build_bootkit; build_qspi ;;
+	bundle) bundle ;;
+	all) build_all; bundle ;;
+	probe)
+		require_macos
+		build_bootkit
+		exec "$loader" probe
+		;;
+	verify) verify ;;
+	boot)
+		require_macos
+		verify
+		printf 'Starting volatile RAM recovery; this host command does not write storage.\n'
+		exec "$loader" boot "$bundle_dir"
+		;;
+	install-help)
+		cat <<'EOF'
+On the Helm debug UART after RAM recovery boots:
+
+  helm-install inspect
+  helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1
+  mkdir -p /mnt/helm-root
+  mount /dev/nvme0n1p1 /mnt/helm-root
+  helm-qspi-install inspect
+  helm-qspi-install install --device /dev/mtd0 \
+    --backup /mnt/helm-root/root/qspi-before.img \
+    --confirm helm-orin-nx-8gb-r39.2
+
+The NVMe and QSPI install commands are destructive. QSPI install first writes a
+complete backup onto the mounted NVMe, then requires exact profile confirmation.
+EOF
+		;;
+	-h|--help|help|"") usage ;;
+	*)
+		printf 'helm-macos: unknown command: %s\n' "$command_name" >&2
+		usage >&2
+		exit 2
+		;;
+esac

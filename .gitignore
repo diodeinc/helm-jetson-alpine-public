@@ -10,6 +10,8 @@ build/
 **/CMakeFiles/
 **/cmake_install.cmake
 **/compile_commands.json
+**/__pycache__/
+*.pyc
 
 # NVIDIA BSP and generated recovery payloads
 Linux_for_Tegra/

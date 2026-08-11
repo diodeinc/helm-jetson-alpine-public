@@ -1,0 +1,67 @@
+#!/bin/busybox sh
+
+set -u
+
+bb=/bin/busybox
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+log()
+{
+	printf 'helm-recovery: %s\n' "$*" > /dev/console
+}
+
+emergency_shell()
+{
+	log "$1"
+	exec "$bb" sh < /dev/console > /dev/console 2>&1
+}
+
+mkdir -p /dev /dev/pts /proc /sys /run /tmp
+"$bb" mount -t devtmpfs devtmpfs /dev || emergency_shell "cannot mount devtmpfs"
+"$bb" mount -t devpts devpts /dev/pts || :
+"$bb" mount -t proc proc /proc || emergency_shell "cannot mount proc"
+"$bb" mount -t sysfs sysfs /sys || emergency_shell "cannot mount sysfs"
+"$bb" mount -t tmpfs tmpfs /run || emergency_shell "cannot mount /run"
+"$bb" mount -t tmpfs tmpfs /tmp || emergency_shell "cannot mount /tmp"
+
+kernel_release=$("$bb" uname -r)
+module_dir=/lib/modules/$kernel_release
+
+load_module()
+{
+	name=$1
+	module=$("$bb" find "$module_dir" -type f -name "$name.ko" 2>/dev/null | \
+		"$bb" head -n 1)
+	if [ -n "$module" ]; then
+		"$bb" insmod "$module" 2>/dev/null || :
+	fi
+}
+
+for module in spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+	load_module "$module"
+done
+
+if [ -x /sbin/udevd ]; then
+	/sbin/udevd --daemon || :
+	udevadm trigger --action=add || :
+	udevadm settle --timeout=10 || :
+fi
+
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+	set -- /dev/nvme[0-9]n[0-9]
+	[ -b "$1" ] && break
+	attempt=$((attempt + 1))
+	"$bb" sleep 0.1
+done
+
+log "Helm Alpine RAM recovery is ready"
+{
+	printf '\nHelm Alpine RAM recovery\n'
+	printf 'This environment has not written QSPI or NVMe.\n\n'
+	/usr/sbin/helm-install inspect
+	printf '\nTo install after checking the target:\n'
+	printf '  helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1\n\n'
+} > /dev/console 2>&1
+
+exec "$bb" sh < /dev/console > /dev/console 2>&1
