@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)
 INSTALL_DIR=${HELM_MACOS_TOOLS_DIR:-$REPO_ROOT/build/macos-tools}
 IMAGE_NAME=${HELM_TEGRAFLASH_IMAGE:-helm-tegraflash-r39.2:macos}
 MODE=${1:-all}

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source-checks:
+    name: Source checks (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cmake \
+            device-tree-compiler \
+            libusb-1.0-0-dev \
+            pkg-config \
+            ripgrep \
+            shellcheck
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt \
+            --no-self-update
+          rustup default stable
+
+      - name: Validate shell scripts
+        run: |
+          mapfile -t scripts < <(rg -l '^#!' os tools --glob '!**/target/**')
+          test "${#scripts[@]}" -gt 0
+          for script in "${scripts[@]}"; do
+            sh -n "$script"
+          done
+          shellcheck --shell=sh --severity=warning "${scripts[@]}"
+
+      - name: Compile device-tree overlay
+        run: |
+          mkdir -p build/ci-device-tree
+          dtc -@ -I dts -O dtb \
+            -o build/ci-device-tree/helm-p3768.dtbo \
+            os/alpine/device-tree/helm-p3768.dtso
+          test -s build/ci-device-tree/helm-p3768.dtbo
+
+      - name: Check and test Rust bridge
+        run: |
+          cargo fmt \
+            --manifest-path tools/tegraflash-macos/Cargo.toml \
+            --check
+          cargo test \
+            --locked \
+            --manifest-path tools/tegraflash-macos/Cargo.toml
+
+      - name: Build and test APX tools
+        run: |
+          cmake \
+            -S tools/apx-macos \
+            -B build/ci-apx \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/ci-apx --parallel 2
+          ctest --test-dir build/ci-apx --output-on-failure
+
+  macos-native:
+    name: Native tools (Apple silicon)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify Apple silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install system dependencies
+        run: brew install cmake libusb pkg-config
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt \
+            --no-self-update
+          rustup default stable
+
+      - name: Build and test native tools
+        run: |
+          ./tools/apx-macos/build.sh
+          ./tools/tegraflash-macos/build.sh native
+          build/macos-tools/bin/apxctl --help >/dev/null
+          build/macos-tools/bin/helm-apx-bridge --help >/dev/null

@@ -1,5 +1,8 @@
 #!/sbin/openrc-run
 
+# OpenRC consumes these service-definition globals.
+# shellcheck disable=SC2034
+
 name="Helm peripheral initialization"
 description="Loads Helm carrier drivers and assigns status LED triggers"
 command="/usr/sbin/helm-peripherals"

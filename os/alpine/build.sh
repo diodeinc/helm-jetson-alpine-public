@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 
 l4t_archive=${HELM_L4T_ARCHIVE:-"$repo_dir/build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2"}
 build_dir=${HELM_ALPINE_BUILD_DIR:-"$repo_dir/build/helm-alpine"}

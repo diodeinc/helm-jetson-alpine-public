@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)
 L4T_ARCHIVE=${HELM_L4T_ARCHIVE:-$REPO_ROOT/build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2}
 L4T_PARENT=${HELM_L4T_PARENT:-$REPO_ROOT/build/macos-flash-port}
 L4T_DIR=${HELM_L4T_DIR:-$L4T_PARENT/Linux_for_Tegra}

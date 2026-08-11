@@ -1,5 +1,7 @@
 # Helm Jetson Alpine
 
+[![CI](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml/badge.svg)](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml)
+
 Experimental, source-only bring-up kit for running a small Alpine Linux system
 on the Diode Helm carrier with an NVIDIA Jetson Orin NX module. The current
 target is the 8 GB `P3767-0001` module, using Alpine 3.24 userspace and the

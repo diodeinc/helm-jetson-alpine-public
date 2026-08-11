@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 build_dir=${HELM_APX_BUILD_DIR:-"$repo_dir/build/apx-macos"}
 install_dir=${HELM_APX_INSTALL_DIR:-"$repo_dir/build/macos-tools"}
 
