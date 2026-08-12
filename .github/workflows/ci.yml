@@ -44,6 +44,7 @@ jobs:
             dtc \
             libarchive \
             libusb \
+            lz4 \
             pkg-config \
             ripgrep \
             shellcheck \
@@ -56,15 +57,33 @@ jobs:
             | xargs -0 -n 1 sh -n
           rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh)' os tools \
             | xargs -0 shellcheck --shell=sh --severity=warning
+          for profile_definition in tools/helm-macos/profiles/*.conf; do
+            sh -n "$profile_definition"
+          done
           python3 -m py_compile \
+            tools/helm-macos/build-r39-family-inputs.py \
             tools/helm-macos/build-rcm-blob.py \
             tools/helm-macos/mkbootimg.py
+          tools/helm-macos/build-r39-family-inputs.py --self-test
           tools/helm-macos/build-rcm-blob.py --self-test
           os/alpine/rootfs-overlay/usr/sbin/helm-install --help >/dev/null
           os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install --help >/dev/null
-          test "$(shasum tools/helm-macos/profile-data/r39.2/qspi_bootblob_ver.txt \
+          os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install self-test
+          test "$(shasum tools/helm-macos/profile-data/r39.2/helm-orin-nx-8gb-r39.2/qspi_bootblob_ver.txt \
             | awk '{print $1}')" = \
             91272c6e6bda545bb804856a093eb57168cda3ca
+          test "$(tools/helm-macos/helm-macos profiles | wc -l | tr -d ' ')" = 5
+          for profile in \
+            helm-orin-nx-16gb-r39.2 \
+            helm-orin-nx-8gb-r39.2 \
+            helm-orin-nano-8gb-r39.2 \
+            helm-orin-nano-4gb-r39.2 \
+            helm-orin-nano-8gb-sd-r39.2
+          do
+            tools/helm-macos/helm-macos --profile "$profile" --help >/dev/null
+            tools/helm-macos/helm-macos --profile "$profile" install-help \
+              | grep -q -- "--confirm $profile"
+          done
 
       - name: Test native Android boot-image builder
         run: |

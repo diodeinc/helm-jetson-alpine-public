@@ -217,7 +217,7 @@ cp -a "$rootfs_dir/lib/ld-musl-aarch64.so.1" "$initramfs_dir/lib/"
 cp -a "$rootfs_dir/lib/libc.musl-aarch64.so.1" "$initramfs_dir/lib/"
 
 module_source=$rootfs_dir/lib/modules/$kernel_release
-for module in spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+for module in at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
 	module_path=$(find "$module_source" -type f -name "$module.ko" -print | head -n 1)
 	if [ -n "$module_path" ]; then
 		relative_path=${module_path#"$module_source"/}
@@ -264,8 +264,8 @@ clean_directory "$recovery_dir"
 mkdir -p "$recovery_dir/lib" "$recovery_dir/opt/helm/payload"
 
 # The recovery environment uses Alpine's complete small userspace, but carries
-# only the kernel modules needed to discover NVMe. The install archive contains
-# the full target module and firmware trees.
+# only the kernel modules needed to identify the module and discover QSPI/NVMe.
+# The install archive contains the full target module and firmware trees.
 for directory in bin etc sbin usr var; do
 	cp -a "$rootfs_dir/$directory" "$recovery_dir/"
 done
@@ -283,7 +283,7 @@ install -m 0755 "$script_dir/initramfs/recovery-init" "$recovery_dir/init"
 install -m 0644 "$rootfs_archive" \
 	"$recovery_dir/opt/helm/payload/helm-rootfs.tar.zst"
 
-for module in spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+for module in at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
 	module_path=$(find "$module_source" -type f -name "$module.ko" -print | head -n 1)
 	if [ -n "$module_path" ]; then
 		relative_path=${module_path#"$module_source"/}
@@ -346,6 +346,7 @@ test -x "$rootfs_dir/sbin/sfdisk"
 test -s "$rootfs_dir/boot/Image"
 test -s "$rootfs_dir/boot/initramfs-helm"
 test -s "$rootfs_dir/boot/dtb/helm-p3768.dtbo"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/misc/eeprom/at24.ko"
 test -e "$rootfs_dir/lib/modules/$kernel_release/kernel/drivers/pci/controller/dwc/pcie-tegra194.ko"
 test -e "$rootfs_dir/lib/modules/$kernel_release/updates/drivers/net/ethernet/realtek/r8168/r8168.ko"
 test -s "$recovery_initramfs"

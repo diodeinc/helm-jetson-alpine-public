@@ -1,8 +1,8 @@
 # Helm Alpine Linux
 
-This directory builds Alpine Linux 3.24 for the Diode Helm carrier and NVIDIA
-Jetson Orin NX/Nano modules. The primary profile is Orin NX 8 GB
-(`P3767-0001`) with the Jetson Linux R39.2 6.8.12-tegra kernel.
+This directory builds Alpine Linux 3.24 for the Diode Helm carrier and all five
+supported Jetson Orin NX/Nano P3767 modules: 0000, 0001, 0003, 0004, and 0005.
+It uses the Jetson Linux R39.2 6.8.12-tegra kernel.
 
 The build runs directly on Apple-silicon macOS. It does not start a container
 or VM, run an NVIDIA host executable, access USB, or write target storage.
@@ -11,7 +11,8 @@ or VM, run an NVIDIA host executable, access USB, or write target storage.
 
 - OpenRC, DHCP, chrony, key-only Dropbear, eudev, and a debug serial console
 - NVIDIA kernel, in-tree/out-of-tree modules, and target firmware
-- NVMe-capable normal and recovery initramfs images
+- NVMe-capable normal and recovery initramfs images, including module EEPROM
+  identification for guarded QSPI provisioning
 - C4 x4 NVMe and C8 PCIe Realtek GbE (`r8168`)
 - USB2 recovery/device mode and both Helm USB 3 host ports
 - PWM fan/tachometer kernel support
@@ -84,10 +85,11 @@ targets, writes one GPT Linux partition, formats it as ext4 with label
 and unmounts. NVIDIA UEFI can load extlinux and the kernel directly from that
 ext4 filesystem, so this layout needs no separate EFI System Partition.
 
-`helm-install` never writes `/dev/mtd0` or QSPI. The native `helm-macos bundle`
-step augments this base recovery image with a fixed 64 MiB QSPI image and the
-separate `helm-qspi-install` command. After the NVMe install succeeds, mount
-it so the QSPI backup lands on persistent storage:
+`helm-install` never writes `/dev/mtd0` or QSPI. The native `helm-macos
+family-bundle` step augments this shared base recovery image with the selected
+module's fixed 64 MiB QSPI image, profile metadata, and the separate
+`helm-qspi-install` command. After the NVMe install succeeds, mount it so the
+QSPI backup lands on persistent storage:
 
 ```sh
 mkdir -p /mnt/helm-root
@@ -98,11 +100,13 @@ helm-qspi-install install --device /dev/mtd0 \
   --confirm helm-orin-nx-8gb-r39.2
 ```
 
-The QSPI installer checks the exact 64 MiB/64 KiB MTD geometry and image
-checksum, requires an unused backup path on a mounted block filesystem, backs
-up the complete device, uses `flashcp`, and verifies a full readback. It is a
-destructive bring-up path whose first physical write and cold boot have not
-yet been qualified.
+The confirmation value is the profile selected while bundling. The QSPI
+installer reads the module EEPROM and refuses a P3767 SKU mismatch before it
+checks the exact 64 MiB/64 KiB MTD geometry and image checksum. It requires an
+unused backup path on a mounted block filesystem, backs up the complete device,
+uses `flashcp`, and verifies a full readback. It is a destructive bring-up path
+whose catalogs are structurally verified for all five module SKUs, but whose
+first physical write and cold boot have not yet been qualified.
 
 ## First boot
 
@@ -117,5 +121,8 @@ cat /run/helm-peripherals
 
 The `helm-peripherals` OpenRC service regenerates module dependencies, loads
 carrier drivers, initializes GPIO LED triggers, and records detected GPIO,
-NVMe, LED, and thermal devices. The default hostname is `helm`; `dhcpcd`
-requests an address on available interfaces.
+NVMe, LED, and thermal devices. The default extlinux entry lets firmware select
+the module base DTB and applies the common Helm carrier overlay. Explicit full
+DTBs for all five SKUs remain available as recovery/fallback entries. The
+default hostname is `helm`; `dhcpcd` requests an address on available
+interfaces.

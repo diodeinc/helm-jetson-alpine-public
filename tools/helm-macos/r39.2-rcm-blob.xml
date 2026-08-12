@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <file_list mode="blob">
-  <!-- Fixed P3767-0001 / Helm R39.2 recovery payload order. -->
+  <!-- Fixed Helm P3767 / R39.2 recovery payload order; aliases are per-profile. -->
   <file name="uefi_t23x_general_with_dtb_sigheader.bin.encrypt" type="bootloader" />
   <file name="pscfw_t234_prod_sigheader.bin.encrypt" type="psc_fw" />
   <file name="mce_flash_o10_cr_prod_sigheader.bin.encrypt" type="mts_mce" />
@@ -9,15 +9,15 @@
   <file name="mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt" type="mb2_bootloader" />
   <file name="xusb_t234_prod_sigheader.bin.encrypt" type="xusb_fw" />
   <file name="nvpva_020_sigheader.fw.encrypt" type="pva_fw" />
-  <file name="display-t234-dce_with_kernel_tegra234-p3768-0000+p3767-0001-nv_sigheader.bin.encrypt" type="dce_fw" />
+  <file name="helm-dce-fw.bin" type="dce_fw" />
   <file name="nvdec_t234_prod_sigheader.fw.encrypt" type="nvdec" />
-  <file name="bpmp_t234-TE980M-A1_prod_sigheader.bin.encrypt" type="bpmp_fw" />
-  <file name="tegra234-bpmp-3767-0001-3509-a02_with_odm_sigheader.dtb.encrypt" type="bpmp_fw_dtb" />
+  <file name="helm-bpmp-fw.bin" type="bpmp_fw" />
+  <file name="helm-bpmp-fw.dtb" type="bpmp_fw_dtb" />
   <file name="camera-rtcpu-t234-rce_sigheader.img.encrypt" type="rce_fw" />
   <file name="adsp-fw_sigheader.bin.encrypt" type="ape_fw" />
   <file name="spe_t234_sigheader.bin.encrypt" type="spe_fw" />
   <file name="tos-optee_t234_sigheader.img.encrypt" type="tos" />
   <file name="eks_t234_sigheader.img.encrypt" type="eks" />
   <file name="helm-recovery-boot.img" type="kernel" />
-  <file name="helm-p3767-0001.dtb" type="kernel_dtb" />
+  <file name="helm-module.dtb" type="kernel_dtb" />
 </file_list>

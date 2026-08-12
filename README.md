@@ -2,14 +2,29 @@
 
 [![Native macOS CI](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml/badge.svg)](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml)
 
-A small Alpine Linux appliance OS for the Diode Helm carrier and NVIDIA Jetson
-Orin NX 8 GB (`P3767-0001`). The current image combines Alpine 3.24 with the
-Jetson Linux R39.2 kernel, modules, firmware, and a Helm-specific device tree.
+A small Alpine Linux appliance OS for the Diode Helm carrier and the complete
+Jetson Orin NX/Nano P3767 module family supported by Helm. The image combines
+Alpine 3.24 with the Jetson Linux R39.2 kernel, modules, firmware, and
+Helm-specific device trees.
 
 Alpine is a good fit for Helm: OpenRC keeps the boot path small, the base image
 is easy to audit, and the target needs no desktop or Ubuntu package layer.
 CUDA and NVIDIA's glibc graphics/compute stack are intentionally not part of
 the base OS.
+
+## Supported modules
+
+| Native profile | Module | Recovery USB |
+| --- | --- | --- |
+| `helm-orin-nx-16gb-r39.2` | Orin NX 16 GB, P3767-0000 | `0955:7323` |
+| `helm-orin-nx-8gb-r39.2` | Orin NX 8 GB, P3767-0001 | `0955:7423` |
+| `helm-orin-nano-8gb-r39.2` | Orin Nano 8 GB, P3767-0003 | `0955:7523` |
+| `helm-orin-nano-4gb-r39.2` | Orin Nano 4 GB, P3767-0004 | `0955:7623` |
+| `helm-orin-nano-8gb-sd-r39.2` | Orin Nano 8 GB dev-kit/SD, P3767-0005 | `0955:7523` |
+
+The original Jetson Nano (T210/P3448) and Xavier NX (T194/P3668) are not in
+scope: they use different SoCs, power/pin requirements, and boot stacks from
+the P3767 modules for which Helm was designed.
 
 ## Current status
 
@@ -24,14 +39,19 @@ Rosetta, or NVIDIA Linux host executable.
 - The separate `t234-bootkit` native libusb loader sends the six-file RCM
   bundle from macOS. The host-side `boot` operation is volatile and does not
   write QSPI or NVMe.
-- Native Python tooling imports NVIDIA's recorded R39.2 QSPI partition index,
-  verifies every catalog payload, and produces the fixed 64 MiB raw image.
+- Native Python tooling extracts the selected SKU from NVIDIA's pinned R39.2
+  multi-spec bootloader capsule, derives its recovery components, verifies
+  every catalog payload, and produces its fixed 64 MiB raw QSPI image.
+- Recovery PID matching and target-side module EEPROM matching prevent a
+  selected profile from being used on a different module SKU.
 
-The R39.2 bundle is structurally verified but has not yet completed its first
-hardware boot on this profile. Treat it as bring-up software. The QSPI writer
-requires a complete backup, exact profile confirmation, and full-device
-readback verification. Its first write and cold-boot qualification are still
-pending, so do not use it on irreplaceable hardware.
+All five per-SKU catalogs, QSPI images, and recovery bundles are structurally
+verified on macOS. P3767-0001 additionally reproduces the qualified recovery
+MB1 BCT, memory BCT, and DCE component byte-for-byte. Hardware RAM-boot, QSPI
+write, and cold-boot qualification are still pending, so treat this as
+bring-up software and do not use it on irreplaceable hardware. Firmware and
+DRAM BCTs are selected by exact NVIDIA module spec; they are never borrowed
+from a nearby SKU.
 
 ## Native macOS build
 
@@ -40,12 +60,12 @@ Requirements:
 - Apple-silicon macOS
 - NVIDIA `Jetson_Linux_R39.2.0_aarch64.tbz2`
 - access to [`diodeinc/t234-bootkit`](https://github.com/diodeinc/t234-bootkit)
-- a fixed-profile R39.2 signed input directory for RCM bundle assembly
+- the qualified, unfused P3767-0001 R39.2 signed seed catalog
 
 Install host tools:
 
 ```sh
-brew install apko cmake cpio dtc libarchive libusb pkg-config shellcheck zstd
+brew install apko cmake cpio dtc libarchive libusb lz4 pkg-config shellcheck zstd
 ```
 
 Place the BSP at `build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2`, then:
@@ -53,31 +73,41 @@ Place the BSP at `build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2`, then:
 ```sh
 ./tools/helm-macos/helm-macos bootstrap
 ./tools/helm-macos/helm-macos build
+./tools/helm-macos/helm-macos profiles
 ```
 
 The BSP is consumed as a data archive. Its Linux host programs are never
-executed. NVIDIA target firmware remains a required opaque input.
+executed. The family builder automatically downloads and hash-checks NVIDIA's
+official R39.2 bootloader package; its multi-spec capsule remains opaque target
+firmware and is not executed on the Mac.
 
-To assemble the fixed P3767-0001/Helm recovery bundle and its QSPI image:
+Point the family builder at the qualified 0001 seed, then build one selected
+profile or the complete five-profile matrix:
 
 ```sh
-HELM_R39_SIGNED_DIR=/absolute/path/to/r39.2-signed \
-  ./tools/helm-macos/helm-macos bundle
+export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/qualified-p3767-0001/signed
+
+./tools/helm-macos/helm-macos \
+  --profile helm-orin-nano-4gb-r39.2 family-all
+
+./tools/helm-macos/helm-macos family-matrix
 ```
 
-The signed directory and its recorded flash index are profile catalog inputs,
-not an executable toolchain. They are deliberately excluded from Git. See
+The seed directory and generated catalogs are profile data, not executable
+Linux tooling. They are deliberately excluded from Git. Existing exact-SKU
+catalogs can still be supplied directly through `HELM_R39_SIGNED_DIR`. See
 [`tools/helm-macos/README.md`](tools/helm-macos/README.md) for its exact scope
 and the bundle contract.
 
 ## RAM boot and target-side install
 
-With one T234 recovery device connected directly to the Mac:
+With one selected P3767 recovery device connected directly to the Mac:
 
 ```sh
-./tools/helm-macos/helm-macos probe
-./tools/helm-macos/helm-macos verify
-./tools/helm-macos/helm-macos boot
+profile=helm-orin-nx-8gb-r39.2
+./tools/helm-macos/helm-macos --profile "$profile" probe
+./tools/helm-macos/helm-macos --profile "$profile" verify
+./tools/helm-macos/helm-macos --profile "$profile" boot
 ```
 
 `boot` transfers the recovery environment into RAM. On the Helm debug UART,
@@ -104,12 +134,13 @@ helm-qspi-install install --device /dev/mtd0 \
   --confirm helm-orin-nx-8gb-r39.2
 ```
 
-The last command erases and rewrites all 64 MiB of QSPI. It refuses the wrong
-device geometry, a non-block-backed backup path, insufficient backup space,
-an existing backup file, a bad image checksum, or incorrect confirmation. It
-backs up QSPI before erasing and compares a full-device readback afterward.
-This destructive path is implemented and structurally verified, but not yet
-qualified on the physical Helm.
+The last command erases and rewrites all 64 MiB of QSPI. It refuses a module
+EEPROM that does not match the bundled P3767 SKU, the wrong device geometry, a
+non-block-backed backup path, insufficient backup space, an existing backup
+file, a bad image checksum, or incorrect confirmation. It backs up QSPI before
+erasing and compares a full-device readback afterward. This destructive path
+is implemented and structurally verified, but not yet qualified on a physical
+Helm.
 
 ## Repository layout
 

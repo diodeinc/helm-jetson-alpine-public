@@ -2,7 +2,13 @@
 set -eu
 
 program=${0##*/}
-profile=helm-orin-nx-8gb-r39.2
+metadata=/opt/helm/payload/helm-profile
+manifest=/opt/helm/payload/helm-qspi-manifest.json
+profile=PROFILE_FROM_BUNDLE
+expected_board=
+expected_sku=
+expected_pid=
+module_part_number=
 device=/dev/mtd0
 device_set=0
 image=/opt/helm/payload/helm-qspi.img
@@ -12,6 +18,11 @@ confirm=
 expected_size=67108864
 expected_erase_size=65536
 
+if [ -r "$metadata" ]; then
+	staged_profile=$(awk -F= '$1 == "PROFILE_ID" { print $2; exit }' "$metadata")
+	[ -z "$staged_profile" ] || profile=$staged_profile
+fi
+
 usage()
 {
 	cat <<EOF
@@ -19,6 +30,7 @@ usage:
   $program inspect [--device /dev/mtd0]
   $program install --device /dev/mtd0 --backup /mounted/path/qspi-before.img \\
     --confirm $profile
+  $program self-test
 
 install erases and rewrites the complete 64 MiB QSPI. It requires a backup on
 a mounted block filesystem and exact profile confirmation.
@@ -29,6 +41,79 @@ die()
 {
 	printf '%s: %s\n' "$program" "$*" >&2
 	exit 1
+}
+
+metadata_value()
+{
+	key=$1
+	awk -F= -v key="$key" '$1 == key { print $2; exit }' "$metadata"
+}
+
+profile_identity_supported()
+{
+	case "$1:$2:$3:$4" in
+		helm-orin-nx-16gb-r39.2:3767:0000:0x7323|\
+		helm-orin-nx-8gb-r39.2:3767:0001:0x7423|\
+		helm-orin-nano-8gb-r39.2:3767:0003:0x7523|\
+		helm-orin-nano-4gb-r39.2:3767:0004:0x7623|\
+		helm-orin-nano-8gb-sd-r39.2:3767:0005:0x7523) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+module_matches_sku()
+{
+	case "$1" in
+		*"3767-$2"*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+self_test()
+{
+	profile_identity_supported helm-orin-nx-16gb-r39.2 3767 0000 0x7323
+	profile_identity_supported helm-orin-nx-8gb-r39.2 3767 0001 0x7423
+	profile_identity_supported helm-orin-nano-8gb-r39.2 3767 0003 0x7523
+	profile_identity_supported helm-orin-nano-4gb-r39.2 3767 0004 0x7623
+	profile_identity_supported helm-orin-nano-8gb-sd-r39.2 3767 0005 0x7523
+	! profile_identity_supported helm-orin-nano-8gb-r39.2 3767 0005 0x7523
+	module_matches_sku '699-13767-0003-500' 0003
+	! module_matches_sku '699-13767-0005-500' 0003
+	printf '%s: profile and EEPROM guards passed\n' "$program"
+}
+
+load_profile()
+{
+	[ -s "$metadata" ] || die "bundle profile metadata is missing: $metadata"
+	profile=$(metadata_value PROFILE_ID)
+	expected_board=$(metadata_value BOARD_ID)
+	expected_sku=$(metadata_value BOARD_SKU)
+	expected_pid=$(metadata_value USB_PID)
+	profile_identity_supported \
+		"$profile" "$expected_board" "$expected_sku" "$expected_pid" || \
+		die "invalid or unsupported bundle profile metadata"
+	[ -s "$manifest" ] || die "QSPI manifest is missing: $manifest"
+	grep -F -- "\"profile\": \"$profile\"" "$manifest" >/dev/null || \
+		die "QSPI manifest and bundle profile disagree"
+}
+
+validate_module()
+{
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+		for eeprom in /sys/bus/i2c/devices/*-0050/eeprom; do
+			[ -r "$eeprom" ] || continue
+			part_number=$(dd if="$eeprom" bs=1 skip=20 count=30 2>/dev/null | \
+				tr -cd '[:print:]')
+			if module_matches_sku "$part_number" "$expected_sku"; then
+				module_part_number=$part_number
+				return 0
+			fi
+		done
+		attempt=$((attempt + 1))
+		sleep 0.1
+	done
+	die "module EEPROM does not identify the required P3767-$expected_sku SKU"
 }
 
 canonical_mtd()
@@ -50,6 +135,8 @@ geometry()
 	actual_size=$(cat "/sys/class/mtd/$base/size")
 	actual_erase_size=$(cat "/sys/class/mtd/$base/erasesize")
 	printf 'profile:    %s\n' "$profile"
+	printf 'module:     %s\n' "$module_part_number"
+	printf 'recovery:   0955:%s\n' "${expected_pid#0x}"
 	printf 'device:     %s\n' "$device"
 	printf 'size:       %s bytes\n' "$actual_size"
 	printf 'erase size: %s bytes\n' "$actual_erase_size"
@@ -110,6 +197,8 @@ case "$command_name" in
 	inspect)
 		[ -z "$backup" ] || die "--backup is invalid with inspect"
 		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
+		load_profile
+		validate_module
 		device=$(canonical_mtd "$device")
 		geometry
 		validate_geometry
@@ -120,6 +209,11 @@ case "$command_name" in
 		exit 0
 		;;
 	install) ;;
+	self-test)
+		[ "$#" -eq 0 ] || die "self-test takes no arguments"
+		self_test
+		exit 0
+		;;
 	-h|--help|help|"")
 		usage
 		exit 0
@@ -128,6 +222,9 @@ case "$command_name" in
 esac
 
 [ "$(id -u)" -eq 0 ] || die "install must run as root"
+[ "$command_name" = install ] || die "internal command dispatch error"
+load_profile
+validate_module
 [ "$device_set" -eq 1 ] || die "install requires --device"
 device=$(canonical_mtd "$device")
 [ "$confirm" = "$profile" ] || die "--confirm must exactly equal $profile"

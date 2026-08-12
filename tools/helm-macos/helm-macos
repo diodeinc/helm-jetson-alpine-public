@@ -3,41 +3,119 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+profile_name=${HELM_PROFILE:-helm-orin-nx-8gb-r39.2}
+if [ "${1:-}" = "--profile" ]; then
+	[ "$#" -ge 2 ] || { printf 'helm-macos: --profile needs a value\n' >&2; exit 2; }
+	profile_name=$2
+	shift 2
+fi
+case "$profile_name" in
+	helm-orin-nx-16gb-r39.2|helm-orin-nx-8gb-r39.2|\
+	helm-orin-nano-8gb-r39.2|helm-orin-nano-4gb-r39.2|\
+	helm-orin-nano-8gb-sd-r39.2) ;;
+	*) printf 'helm-macos: unknown profile: %s\n' "$profile_name" >&2; exit 2 ;;
+esac
+profile_file=$script_dir/profiles/$profile_name.conf
+[ -r "$profile_file" ] || {
+	printf 'helm-macos: profile definition is missing: %s\n' "$profile_file" >&2
+	exit 1
+}
+profile_id=
+profile_board=
+profile_sku=
+profile_usb_pid=
+profile_kernel_dtb=
+profile_bpmp_fw=
+profile_bpmp_dtb=
+profile_dce_rcm=
+profile_dce_qspi=
+# Profile definitions are tracked source containing assignments only.
+# shellcheck disable=SC1090
+. "$profile_file"
+case "$profile_id:$profile_sku:$profile_usb_pid" in
+	helm-orin-nx-16gb-r39.2:0000:0x7323|\
+	helm-orin-nx-8gb-r39.2:0001:0x7423|\
+	helm-orin-nano-8gb-r39.2:0003:0x7523|\
+	helm-orin-nano-4gb-r39.2:0004:0x7623|\
+	helm-orin-nano-8gb-sd-r39.2:0005:0x7523) ;;
+	*) printf 'helm-macos: invalid profile identity: %s\n' "$profile_file" >&2; exit 1 ;;
+esac
+[ "$profile_id" = "$profile_name" ] || {
+	printf 'helm-macos: profile filename and ID disagree\n' >&2
+	exit 1
+}
+
 build_dir=${HELM_MACOS_BUILD_DIR:-"$repo_dir/build/helm-macos"}
 alpine_build_dir=${HELM_ALPINE_BUILD_DIR:-"$repo_dir/build/helm-alpine-native"}
-signed_dir=${HELM_R39_SIGNED_DIR:-"$repo_dir/build/inputs/r39.2-signed"}
-bundle_dir=${HELM_RCM_BUNDLE_DIR:-"$build_dir/rcm-r39.2-p3767-0001"}
-qspi_dir=$build_dir/qspi-r39.2-p3767-0001
+signed_dir=${HELM_R39_SIGNED_DIR:-"$repo_dir/build/inputs/r39.2/$profile_id/signed"}
+seed_signed_dir=${HELM_R39_SEED_SIGNED_DIR:-"$repo_dir/build/inputs/r39.2/helm-orin-nx-8gb-r39.2/signed"}
+bundle_dir=${HELM_RCM_BUNDLE_DIR:-"$build_dir/rcm-r39.2-p3767-$profile_sku"}
+qspi_dir=$build_dir/qspi-r39.2-p3767-$profile_sku
 qspi_catalog=$qspi_dir/catalog
 qspi_image=$qspi_dir/helm-qspi.img
-provision_dir=$build_dir/work/provisioning-initramfs
-provision_initramfs=$build_dir/helm-provisioning-initramfs.gz
-provision_boot=$build_dir/helm-provisioning-boot.img
-stage_dir=$build_dir/work/rcm-stage
+provision_dir=$build_dir/work/provisioning-p3767-$profile_sku
+provision_initramfs=$build_dir/helm-provisioning-p3767-$profile_sku-initramfs.gz
+provision_boot=$build_dir/helm-provisioning-p3767-$profile_sku-boot.img
+stage_dir=$build_dir/work/rcm-stage-p3767-$profile_sku
+profile_data_dir=$script_dir/profile-data/r39.2/$profile_id
 bootkit_dir=${HELM_T234_BOOTKIT_DIR:-"$repo_dir/../t234-bootkit"}
-loader=$bootkit_dir/macos-rcm/jetson-rcm
 bootkit_commit=5cedc336c859a2561644475aef057feaf41e73c0
+bootkit_patch=$script_dir/t234-bootkit-orin-family.patch
+bootkit_work_dir=$build_dir/work/t234-bootkit
+bootkit_tools_dir=$bootkit_work_dir/tools
+loader=$bootkit_work_dir/macos-rcm/jetson-rcm
+family_builder=$script_dir/build-r39-family-inputs.py
+family_source_dir=$build_dir/work/r39.2-family-source
+family_capsule=$family_source_dir/opt/ota_package/t23x/TEGRA_BL_3767.Cap
+family_profile_dir=$build_dir/family-inputs/r39.2/$profile_id
+family_signed_dir=$family_profile_dir/signed
+bootloader_deb=${HELM_R39_BOOTLOADER_DEB:-"$repo_dir/build/downloads/nvidia-l4t-bootloader_39.2.0-20260601141651_arm64.deb"}
+bootloader_deb_url=https://repo.download.nvidia.com/jetson/som/pool/main/n/nvidia-l4t-bootloader/nvidia-l4t-bootloader_39.2.0-20260601141651_arm64.deb
+bootloader_deb_sha256=01ef88369674ab5b9dd0dca6378e19012b594b4b3b95f2378b2d191ee0c331be
+family_capsule_sha256=6b105ccfa982f76c3b235d4b348fbb52a0a59936136db722c14a47ca6a2d0185
+family_bup_sha256=ee84d87dc76b5e8f6d007cffee7b1c48d5b86476397e7ee6c4a2b63519816b01
+seed_flash_index_sha256=d6cbc5ab52375bdc917062c88840a411a0e1eb195b466be119df24209c8b1727
 
 usage()
 {
 	cat <<EOF
-usage: $0 COMMAND
+usage: $0 [--profile PROFILE] COMMAND
 
 Native Apple-silicon macOS commands:
+  profiles    list supported Helm Orin NX/Nano module profiles
   doctor      check host tools, fixed-profile inputs, and APX presence
   bootstrap   clone and build the pinned native t234-bootkit loader
   build       build APX tools, Alpine, recovery initramfs, and boot image
+  prepare     derive this SKU's inputs from NVIDIA's pinned multi-spec BUP
+  prepare-all derive inputs for all five Helm-compatible P3767 SKUs
   qspi        build and verify the fixed 64 MiB QSPI image (no device access)
   bundle      embed QSPI/NVMe installers and verify the native RCM bundle
   all         run build followed by bundle
+  family-bundle prepare and bundle the selected family profile
+  family-all  run build followed by family-bundle for the selected profile
+  family-matrix build and bundle all five family profiles
   probe       inspect the attached T234 recovery interface (read-only)
   verify      verify the six-file RCM bundle (read-only)
   boot        volatile RAM-boot the recovery installer (does not write storage)
   install-help show the guarded command to run on the Jetson recovery console
 
-No command here runs Docker, a VM, or an NVIDIA host executable. The bundle
-uses fixed P3767-0001/Helm signed firmware data from HELM_R39_SIGNED_DIR.
+The default profile is helm-orin-nx-8gb-r39.2. No command here runs Docker, a
+VM, or an NVIDIA host executable. Direct catalogs come from
+HELM_R39_SIGNED_DIR; family preparation derives fixed per-SKU catalogs from
+NVIDIA's official multi-spec BUP and HELM_R39_SEED_SIGNED_DIR.
 EOF
+}
+
+list_profiles()
+{
+	for definition in "$script_dir"/profiles/*.conf; do
+		(
+			# shellcheck disable=SC1090
+			. "$definition"
+			printf '%-34s  P3767-%s  USB 0955:%s  %s\n' \
+				"$profile_id" "$profile_sku" "${profile_usb_pid#0x}" "$profile_board"
+		)
+	done
 }
 
 die()
@@ -66,7 +144,8 @@ clean_directory()
 {
 	directory=$1
 	case "$directory" in
-		"$qspi_dir"|"$provision_dir"|"$stage_dir"|"$bundle_dir") ;;
+		"$qspi_dir"|"$provision_dir"|"$stage_dir"|"$bundle_dir"|\
+		"$bootkit_work_dir"|"$family_source_dir"|"$family_profile_dir") ;;
 		*) die "refusing to clean unexpected directory: $directory" ;;
 	esac
 	mkdir -p "$directory"
@@ -75,9 +154,111 @@ clean_directory()
 
 build_bootkit()
 {
-	need_file "$bootkit_dir/macos-rcm/src/jetson_rcm.c"
-	make -C "$bootkit_dir/macos-rcm"
+	need_command git
+	need_command patch
+	need_command tar
+	[ -d "$bootkit_dir/.git" ] || die "t234-bootkit checkout is missing: $bootkit_dir"
+	git -C "$bootkit_dir" cat-file -e "$bootkit_commit^{commit}" 2>/dev/null || \
+		die "t234-bootkit does not contain pinned commit $bootkit_commit"
+	need_file "$bootkit_patch"
+	clean_directory "$bootkit_work_dir"
+	git -C "$bootkit_dir" archive "$bootkit_commit" macos-rcm tools | \
+		tar -x -C "$bootkit_work_dir"
+	patch -d "$bootkit_work_dir" -p1 -f -i "$bootkit_patch"
+	make -C "$bootkit_work_dir/macos-rcm"
 	need_file "$loader"
+}
+
+file_sha256()
+{
+	shasum -a 256 "$1" | awk '{print $1}'
+}
+
+ensure_bootloader_package()
+{
+	need_command curl
+	if [ -e "$bootloader_deb" ]; then
+		[ -f "$bootloader_deb" ] || \
+			die "bootloader package path is not a regular file: $bootloader_deb"
+		actual=$(file_sha256 "$bootloader_deb")
+		[ "$actual" = "$bootloader_deb_sha256" ] || \
+			die "bootloader package SHA-256 mismatch: $actual"
+		return
+	fi
+	mkdir -p "$(dirname "$bootloader_deb")"
+	partial=$bootloader_deb.partial
+	printf 'Downloading pinned NVIDIA R39.2 bootloader package...\n'
+	curl --fail --location --retry 3 --output "$partial" "$bootloader_deb_url"
+	actual=$(file_sha256 "$partial")
+	[ "$actual" = "$bootloader_deb_sha256" ] || \
+		die "downloaded bootloader package SHA-256 mismatch: $actual"
+	mv "$partial" "$bootloader_deb"
+}
+
+ensure_family_capsule()
+{
+	if [ -f "$family_capsule" ] && \
+		[ "$(file_sha256 "$family_capsule")" = "$family_capsule_sha256" ]
+	then
+		return
+	fi
+	ensure_bootloader_package
+	archive_tool=$(brew --prefix libarchive)/bin/bsdtar
+	need_file "$archive_tool"
+	clean_directory "$family_source_dir"
+	"$archive_tool" -xf "$bootloader_deb" -C "$family_source_dir"
+	need_file "$family_source_dir/data.tar.zst"
+	"$archive_tool" -xf "$family_source_dir/data.tar.zst" \
+		-C "$family_source_dir" \
+		./opt/ota_package/t23x/TEGRA_BL_3767.Cap
+	need_file "$family_capsule"
+	actual=$(file_sha256 "$family_capsule")
+	[ "$actual" = "$family_capsule_sha256" ] || \
+		die "extracted NVIDIA capsule SHA-256 mismatch: $actual"
+}
+
+prepare_family_inputs()
+{
+	require_macos
+	need_command brew
+	need_command lz4
+	need_command python3
+	need_file "$family_builder"
+	[ -d "$seed_signed_dir" ] || \
+		die "qualified P3767-0001 seed is missing: $seed_signed_dir"
+	build_bootkit
+	ensure_family_capsule
+	clean_directory "$family_profile_dir"
+	python3 "$family_builder" \
+		--capsule "$family_capsule" \
+		--seed "$seed_signed_dir" \
+		--output "$family_signed_dir" \
+		--profile "$profile_id" \
+		--build-bch "$bootkit_work_dir/macos-rcm/scripts/build-bch.py" \
+		--apply-bct-delta "$bootkit_work_dir/macos-rcm/scripts/apply-bct-delta.py" \
+		--lz4 "$(command -v lz4)"
+	(
+		signed_dir=$family_signed_dir
+		validate_signed_profile
+	)
+}
+
+run_all_family_profiles()
+{
+	family_command=$1
+	for family_profile in \
+		helm-orin-nx-16gb-r39.2 \
+		helm-orin-nx-8gb-r39.2 \
+		helm-orin-nano-8gb-r39.2 \
+		helm-orin-nano-4gb-r39.2 \
+		helm-orin-nano-8gb-sd-r39.2
+	do
+		HELM_MACOS_BUILD_DIR=$build_dir \
+		HELM_ALPINE_BUILD_DIR=$alpine_build_dir \
+		HELM_R39_SEED_SIGNED_DIR=$seed_signed_dir \
+		HELM_R39_BOOTLOADER_DEB=$bootloader_deb \
+			"$0" --profile "$family_profile" "$family_command"
+	done
 }
 
 bootstrap()
@@ -105,7 +286,11 @@ doctor()
 {
 	require_macos
 	failures=0
-	for command in apko brew cmake cpio dtc fdtoverlay make pkg-config python3 shasum zstd; do
+	printf 'profile: %s (P3767-%s, USB 0955:%s)\n' \
+		"$profile_id" "$profile_sku" "${profile_usb_pid#0x}"
+	for command in apko brew cmake cpio curl dtc fdtoverlay git lz4 make patch \
+		pkg-config python3 shasum tar zstd
+	do
 		if command -v "$command" >/dev/null 2>&1; then
 			printf 'ok    %s\n' "$command"
 		else
@@ -124,15 +309,45 @@ doctor()
 	else
 		printf 'note  signed input directory is not staged: %s\n' "$signed_dir"
 	fi
+	archive_tool=$(brew --prefix libarchive 2>/dev/null)/bin/bsdtar || archive_tool=
+	if [ -n "$archive_tool" ] && [ -x "$archive_tool" ]; then
+		printf 'ok    native libarchive bsdtar\n'
+	else
+		printf 'ERROR missing Homebrew libarchive bsdtar\n'
+		failures=$((failures + 1))
+	fi
+	if [ -d "$seed_signed_dir" ]; then
+		printf 'ok    qualified P3767-0001 family seed: %s\n' "$seed_signed_dir"
+	else
+		printf 'note  family seed is not staged: %s\n' "$seed_signed_dir"
+	fi
+	if [ -f "$bootloader_deb" ]; then
+		actual=$(file_sha256 "$bootloader_deb")
+		if [ "$actual" = "$bootloader_deb_sha256" ]; then
+			printf 'ok    pinned NVIDIA R39.2 bootloader package\n'
+		else
+			printf 'ERROR NVIDIA bootloader package SHA-256 mismatch\n'
+			failures=$((failures + 1))
+		fi
+	else
+		printf 'note  prepare will download the pinned NVIDIA bootloader package\n'
+	fi
+	if [ -d "$family_signed_dir" ]; then
+		printf 'ok    derived family input: %s\n' "$family_signed_dir"
+	else
+		printf 'note  selected family input is not prepared\n'
+	fi
 	if [ -x "$loader" ]; then
 		printf 'ok    native T234 RCM loader\n'
 	else
 		printf 'note  native loader is not built (run: %s bootstrap)\n' "$0"
 	fi
-	if [ -x "$loader" ] && "$loader" probe >/dev/null 2>&1; then
-		printf 'ok    one T234 APX device is attached\n'
+	if [ -x "$loader" ] && \
+		"$loader" --pid "$profile_usb_pid" probe >/dev/null 2>&1; then
+		printf 'ok    selected P3767-%s APX device is attached\n' "$profile_sku"
 	else
-		printf 'note  no claimable T234 APX device is currently attached\n'
+		printf 'note  selected P3767-%s APX device is not currently attached\n' \
+			"$profile_sku"
 	fi
 	[ "$failures" -eq 0 ]
 }
@@ -152,38 +367,118 @@ copy_payload()
 	cp -p "$signed_dir/$name" "$stage_dir/$name"
 }
 
+copy_payload_as()
+{
+	source_name=$1
+	target_name=$2
+	need_file "$signed_dir/$source_name"
+	cp -p "$signed_dir/$source_name" "$stage_dir/$target_name"
+}
+
+validate_signed_profile()
+{
+	need_file "$signed_dir/flash.idx"
+	signed_parent=$(CDPATH='' cd -- "$signed_dir/.." && pwd)
+	for required in \
+		"$profile_bpmp_fw" \
+		"$profile_bpmp_dtb" \
+		"$profile_dce_rcm" \
+		"$profile_dce_qspi"
+	do
+		need_file "$signed_dir/$required"
+	done
+
+	family_marker=$signed_dir/HELM_R39_FAMILY_INPUT_V1
+	if [ -f "$family_marker" ]; then
+		for marker_line in \
+			FORMAT=HELM_R39_FAMILY_INPUT_V1 \
+			PROFILE="$profile_id" \
+			BOARD_ID=3767 \
+			BOARD_SKU="$profile_sku" \
+			BSP_RELEASE=39.2 \
+			SIGNING=zerosbk \
+			SOURCE=NVIDIA_R39.2_MULTI_SPEC_BUP \
+			NVIDIA_CAPSULE_SHA256="$family_capsule_sha256" \
+			NVIDIA_BUP_SHA256="$family_bup_sha256" \
+			SEED_FLASH_INDEX_SHA256="$seed_flash_index_sha256"
+		do
+			grep -Fqx -- "$marker_line" "$family_marker" || \
+				die "derived family marker mismatch: $marker_line"
+		done
+		need_file "$signed_dir/SHA256SUMS"
+		(
+			cd "$signed_dir"
+			shasum -a 256 -c SHA256SUMS >/dev/null
+		) || die "derived family input checksum verification failed"
+	else
+		need_file "$signed_dir/flash.xml.bin"
+		need_file "$signed_dir/flash.xml.tmp"
+		need_file "$signed_parent/secureflash.xml"
+	fi
+
+	for indexed_payload in \
+		"$profile_bpmp_fw" \
+		"$profile_bpmp_dtb" \
+		"$profile_dce_qspi"
+	do
+		grep -F -- "$indexed_payload" "$signed_dir/flash.idx" >/dev/null || \
+			die "signed flash index is not for $profile_id (missing $indexed_payload)"
+	done
+
+	version_payload=
+	for candidate in \
+		"$signed_dir/qspi_bootblob_ver.txt" \
+		"$profile_data_dir/qspi_bootblob_ver.txt" \
+		"$signed_parent/qspi_bootblob_ver.txt"
+	do
+		if [ -s "$candidate" ]; then
+			version_payload=$candidate
+			break
+		fi
+	done
+	[ -n "$version_payload" ] || \
+		die "signed profile has no qspi_bootblob_ver.txt payload"
+	grep -E "^BOARDID=3767 BOARDSKU=$profile_sku FAB=[0-9]+$" \
+		"$version_payload" >/dev/null || \
+		die "QSPI version payload is not for P3767-$profile_sku: $version_payload"
+}
+
 build_qspi()
 {
 	require_macos
-	need_file "$bootkit_dir/tools/import-nvidia-flash-index.py"
-	need_file "$bootkit_dir/tools/qspi-flash.py"
-	need_file "$signed_dir/flash.idx"
-	signed_parent=$(CDPATH='' cd -- "$signed_dir/.." && pwd)
-	need_file "$signed_parent/secureflash.xml"
+	need_file "$bootkit_tools_dir/import-nvidia-flash-index.py"
+	need_file "$bootkit_tools_dir/qspi-flash.py"
+	validate_signed_profile
 	clean_directory "$qspi_dir"
 
-	python3 "$bootkit_dir/tools/import-nvidia-flash-index.py" \
-		"$signed_dir/flash.idx" \
-		"$signed_dir" \
-		"$qspi_catalog" \
-		--fallback-images "$script_dir/profile-data/r39.2" \
-		--fallback-images "$signed_parent" \
-		--profile helm-orin-nx-8gb-r39.2 \
-		--bsp-release R39.2 \
-		--board "P3767-0001 Orin NX 8GB, Helm carrier" \
-		--device 3:0 \
-		--expected-size 0x4000000 \
-		--erase-block-size 65536 \
-		--oracle "$signed_dir/flash.xml.bin" \
-		--oracle "$signed_dir/flash.xml.tmp" \
-		--oracle "$signed_parent/secureflash.xml"
+	(
+		set -- python3 "$bootkit_tools_dir/import-nvidia-flash-index.py" \
+			"$signed_dir/flash.idx" \
+			"$signed_dir" \
+			"$qspi_catalog" \
+			--fallback-images "$profile_data_dir" \
+			--fallback-images "$signed_parent" \
+			--profile "$profile_id" \
+			--bsp-release R39.2 \
+			--board "$profile_board" \
+			--device 3:0 \
+			--expected-size 0x4000000 \
+			--erase-block-size 65536
+		if [ ! -f "$signed_dir/HELM_R39_FAMILY_INPUT_V1" ]; then
+			set -- "$@" \
+				--oracle "$signed_dir/flash.xml.bin" \
+				--oracle "$signed_dir/flash.xml.tmp" \
+				--oracle "$signed_parent/secureflash.xml"
+		fi
+		"$@"
+	)
 
-	python3 "$bootkit_dir/tools/qspi-flash.py" "$qspi_catalog/manifest.json"
+	python3 "$bootkit_tools_dir/qspi-flash.py" "$qspi_catalog/manifest.json"
 	(
 		cd "$qspi_catalog"
 		shasum -a 256 -c SHA256SUMS
 	)
-	python3 "$bootkit_dir/tools/qspi-flash.py" \
+	python3 "$bootkit_tools_dir/qspi-flash.py" \
 		"$qspi_catalog/manifest.json" \
 		--build-image "$qspi_image"
 	(
@@ -206,6 +501,12 @@ build_provisioning_boot()
 		"$provision_dir/opt/helm/payload/helm-qspi.img"
 	install -m 0644 "$qspi_catalog/manifest.json" \
 		"$provision_dir/opt/helm/payload/helm-qspi-manifest.json"
+	cat > "$provision_dir/opt/helm/payload/helm-profile" <<EOF
+PROFILE_ID=$profile_id
+BOARD_ID=3767
+BOARD_SKU=$profile_sku
+USB_PID=$profile_usb_pid
+EOF
 	(
 		cd "$provision_dir/opt/helm/payload"
 		shasum -a 256 helm-qspi.img > helm-qspi.img.sha256
@@ -214,6 +515,9 @@ build_provisioning_boot()
 	spi_module=$(find "$provision_dir/lib/modules" \
 		-type f -name spi-tegra210-quad.ko -print | head -n 1)
 	[ -n "$spi_module" ] || die "recovery initramfs has no Tegra QSPI driver"
+	eeprom_module=$(find "$provision_dir/lib/modules" \
+		-type f -name at24.ko -print | head -n 1)
+	[ -n "$eeprom_module" ] || die "recovery initramfs has no module EEPROM driver"
 	cpio_tool=$(brew --prefix cpio)/bin/cpio
 	need_file "$cpio_tool"
 	export COPYFILE_DISABLE=1
@@ -248,10 +552,7 @@ bundle()
 		mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt \
 		xusb_t234_prod_sigheader.bin.encrypt \
 		nvpva_020_sigheader.fw.encrypt \
-		display-t234-dce_with_kernel_tegra234-p3768-0000+p3767-0001-nv_sigheader.bin.encrypt \
 		nvdec_t234_prod_sigheader.fw.encrypt \
-		bpmp_t234-TE980M-A1_prod_sigheader.bin.encrypt \
-		tegra234-bpmp-3767-0001-3509-a02_with_odm_sigheader.dtb.encrypt \
 		camera-rtcpu-t234-rce_sigheader.img.encrypt \
 		adsp-fw_sigheader.bin.encrypt \
 		spe_t234_sigheader.bin.encrypt \
@@ -260,12 +561,15 @@ bundle()
 	do
 		copy_payload "$name"
 	done
+	copy_payload_as "$profile_dce_rcm" helm-dce-fw.bin
+	copy_payload_as "$profile_bpmp_fw" helm-bpmp-fw.bin
+	copy_payload_as "$profile_bpmp_dtb" helm-bpmp-fw.dtb
 
 	need_file "$provision_boot"
 	cp -p "$provision_boot" "$stage_dir/helm-recovery-boot.img"
-	helm_dtb=$alpine_build_dir/work/rootfs/boot/dtb/helm-p3767-0001.dtb
+	helm_dtb=$alpine_build_dir/work/rootfs/boot/dtb/$profile_kernel_dtb
 	need_file "$helm_dtb"
-	cp -p "$helm_dtb" "$stage_dir/helm-p3767-0001.dtb"
+	cp -p "$helm_dtb" "$stage_dir/helm-module.dtb"
 
 	python3 "$script_dir/build-rcm-blob.py" \
 		"$script_dir/r39.2-rcm-blob.xml" \
@@ -284,15 +588,17 @@ bundle()
 	done
 
 	cat > "$bundle_dir/PROFILE" <<EOF
-PROFILE=helm-p3767-0001-r39.2-ram-recovery
+PROFILE=$profile_id-ram-recovery
 BSP_RELEASE=39.2
-BOARD=P3767-0001
+BOARD=P3767-$profile_sku
 CARRIER=Diode_Helm
 SIGNING=zerosbk
 HOST_BUILD=macos-native
 HOST_BOOT_PERSISTENT_WRITE=none
 TARGET_INSTALLERS=guarded-nvme-and-qspi
-QSPI_PROFILE=helm-orin-nx-8gb-r39.2
+USB_PID=$profile_usb_pid
+QSPI_PROFILE=$profile_id
+KERNEL_DTB=$profile_kernel_dtb
 EOF
 	(
 		cd "$bundle_dir"
@@ -321,26 +627,44 @@ verify()
 
 command_name=${1:-}
 case "$command_name" in
+	profiles) list_profiles ;;
 	doctor) doctor ;;
 	bootstrap) bootstrap ;;
 	build) build_all ;;
+	prepare) prepare_family_inputs ;;
+	prepare-all) run_all_family_profiles prepare ;;
 	qspi) build_bootkit; build_qspi ;;
 	bundle) bundle ;;
 	all) build_all; bundle ;;
+	family-bundle)
+		prepare_family_inputs
+		signed_dir=$family_signed_dir
+		bundle
+		;;
+	family-all)
+		build_all
+		prepare_family_inputs
+		signed_dir=$family_signed_dir
+		bundle
+		;;
+	family-matrix)
+		build_all
+		run_all_family_profiles family-bundle
+		;;
 	probe)
 		require_macos
 		build_bootkit
-		exec "$loader" probe
+		exec "$loader" --pid "$profile_usb_pid" probe
 		;;
 	verify) verify ;;
 	boot)
 		require_macos
 		verify
 		printf 'Starting volatile RAM recovery; this host command does not write storage.\n'
-		exec "$loader" boot "$bundle_dir"
+		exec "$loader" --pid "$profile_usb_pid" boot "$bundle_dir"
 		;;
 	install-help)
-		cat <<'EOF'
+		cat <<EOF
 On the Helm debug UART after RAM recovery boots:
 
   helm-install inspect
@@ -350,7 +674,7 @@ On the Helm debug UART after RAM recovery boots:
   helm-qspi-install inspect
   helm-qspi-install install --device /dev/mtd0 \
     --backup /mnt/helm-root/root/qspi-before.img \
-    --confirm helm-orin-nx-8gb-r39.2
+    --confirm $profile_id
 
 The NVMe and QSPI install commands are destructive. QSPI install first writes a
 complete backup onto the mounted NVMe, then requires exact profile confirmation.

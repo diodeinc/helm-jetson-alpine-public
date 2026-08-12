@@ -37,7 +37,7 @@ load_module()
 	fi
 }
 
-for module in spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+for module in at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
 	load_module "$module"
 done
 

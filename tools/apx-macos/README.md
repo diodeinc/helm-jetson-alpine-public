@@ -27,8 +27,10 @@ build/macos-tools/bin/apxctl inspect --pid 0x7423 --json
 Those commands only read USB descriptors. They do not consume BootROM data,
 load code, reset the board, or write storage.
 
-Known recovery product IDs are resolved to NVIDIA module SKUs. In particular,
-`0955:7423` is reported as Jetson Orin NX 8GB (`P3767-0001`).
+Known recovery product IDs are resolved to NVIDIA module SKUs. Helm's supported
+P3767 family uses `0x7323` (0000), `0x7423` (0001), `0x7523` (0003/0005), and
+`0x7623` (0004). The 0003 and 0005 modules share a PID; the guarded QSPI
+installer distinguishes those SKUs through the module EEPROM.
 
 The chip UID is BootROM's first 16-byte bulk-IN greeting. Reading it changes
 the protocol position, so it is deliberately guarded:
