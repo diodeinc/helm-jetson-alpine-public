@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ "$#" -eq 0 ]; then
+	set -- provision
+fi
+exec "$repo_dir/tools/helm-macos/helm-macos" "$@"

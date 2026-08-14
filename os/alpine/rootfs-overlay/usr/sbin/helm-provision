@@ -9,9 +9,12 @@ confirm_device=
 confirm_device_seen=0
 confirm_profile=
 confirm_profile_seen=0
+confirm_inventory=
+confirm_inventory_seen=0
 session=
 session_seen=0
 bundle_profile=
+inventory_fingerprint=
 mount_dir=/mnt/helm-provision-root
 root_mounted=0
 succeeded=0
@@ -21,15 +24,18 @@ usage()
 {
 	cat <<EOF
 usage:
+  $program preflight --device /dev/nvme0n1 \\
+    --confirm-profile PROFILE --session 32_LOWERCASE_HEX_CHARACTERS
   $program install --device /dev/nvme0n1 \\
     --confirm-device /dev/nvme0n1 --confirm-profile PROFILE \\
+    [--confirm-inventory 64_LOWERCASE_HEX_CHARACTERS] \\
     --session 32_LOWERCASE_HEX_CHARACTERS
   $program self-test
 
-This is the recovery-only NVMe + QSPI orchestrator. install destroys the
-confirmed NVMe, saves a full QSPI backup on its new root filesystem, then
-rewrites and verifies QSPI. All confirmations must exactly match the embedded
-bundle and selected whole NVMe namespace.
+preflight validates and reports the module, NVMe, QSPI, and payloads without
+writing persistent storage. install destroys the confirmed NVMe, saves a full
+QSPI backup on its new root filesystem, then rewrites and verifies QSPI. All
+confirmations must exactly match the embedded bundle and selected whole NVMe.
 EOF
 }
 
@@ -83,6 +89,62 @@ session_supported()
 	esac
 }
 
+inventory_supported()
+{
+	[ "${#1}" -eq 64 ] || return 1
+	case "$1" in
+		*[!0-9a-f]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+inventory_fingerprint_from_fields()
+{
+	inv_profile=$1
+	inv_device=$2
+	inv_size=$3
+	inv_model=$4
+	inv_serial=$5
+	inv_wwid=$6
+	printf 'profile=%s\ndevice=%s\nsize=%s\nmodel=%s\nserial=%s\nwwid=%s\n' \
+		"$inv_profile" "$inv_device" "$inv_size" "$inv_model" "$inv_serial" \
+		"$inv_wwid" | \
+		sha256sum | awk '{ print $1 }'
+}
+
+inventory_fingerprint_for_device()
+{
+	target=$1
+	base=${target##*/}
+	for identity_path in \
+		"/sys/class/block/$base/size" \
+		"/sys/class/block/$base/device/model" \
+		"/sys/class/block/$base/device/serial" \
+		"/sys/class/block/$base/wwid"
+	do
+		[ -r "$identity_path" ] || \
+			die "NVMe identity is unavailable for inventory binding: $identity_path"
+	done
+	size=$(tr -d '\000\r\n' < "/sys/class/block/$base/size")
+	model=$(tr -d '\000\r\n' < "/sys/class/block/$base/device/model")
+	serial=$(tr -d '\000\r\n' < "/sys/class/block/$base/device/serial")
+	wwid=$(tr -d '\000\r\n' < "/sys/class/block/$base/wwid")
+	case "$size" in
+		''|*[!0-9]*) die "NVMe size is invalid for inventory binding: $target" ;;
+	esac
+	for identity_value in "$model" "$serial" "$wwid"; do
+		case "$identity_value" in
+			*[![:space:]]*) ;;
+			*) die "NVMe model, serial, and WWID must be nonempty for guided binding" ;;
+		esac
+	done
+	fingerprint=$(inventory_fingerprint_from_fields \
+		"$bundle_profile" "$target" "$size" "$model" "$serial" "$wwid")
+	inventory_supported "$fingerprint" || \
+		die "could not create a valid NVMe inventory fingerprint"
+	printf '%s\n' "$fingerprint"
+}
+
 persistent_backup_path_allowed()
 {
 	candidate=$1
@@ -116,6 +178,18 @@ finish()
 	exit "$rc"
 }
 
+run_preflight()
+{
+	printf 'HELM_PROVISION_STAGE preflight profile=%s device=%s\n' \
+		"$bundle_profile" "$device"
+	# Both inspectors validate bundle identity, module EEPROM, target type, QSPI
+	# geometry, and embedded payloads before the first persistent write.
+	helm-install inspect --device "$device"
+	helm-qspi-install inspect --device /dev/mtd0
+	inventory_fingerprint=$(inventory_fingerprint_for_device "$device")
+	printf 'inventory: %s\n' "$inventory_fingerprint"
+}
+
 self_test()
 {
 	for supported_profile in \
@@ -135,6 +209,23 @@ self_test()
 	session_supported 0123456789abcdef0123456789abcdef
 	! session_supported 0123456789ABCDEF0123456789ABCDEF
 	! session_supported 0123456789abcdef
+	inventory_supported \
+		0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+	! inventory_supported 0123456789abcdef
+	! inventory_supported \
+		0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+	first_inventory=$(inventory_fingerprint_from_fields \
+		helm-orin-nx-8gb-r39.2 /dev/nvme0n1 976773168 PNY-CS2142 serial-a \
+		nvme.1987-serial-a-PNY-CS2142-00000001)
+	second_inventory=$(inventory_fingerprint_from_fields \
+		helm-orin-nx-8gb-r39.2 /dev/nvme0n1 976773168 PNY-CS2142 serial-a \
+		nvme.1987-serial-a-PNY-CS2142-00000001)
+	changed_inventory=$(inventory_fingerprint_from_fields \
+		helm-orin-nx-8gb-r39.2 /dev/nvme0n1 976773168 PNY-CS2142 serial-b \
+		nvme.1987-serial-b-PNY-CS2142-00000001)
+	inventory_supported "$first_inventory"
+	[ "$first_inventory" = "$second_inventory" ]
+	[ "$first_inventory" != "$changed_inventory" ]
 	persistent_backup_path_allowed \
 		/mnt/helm-provision-root/root/qspi-before.img
 	for forbidden_backup in \
@@ -177,6 +268,14 @@ while [ "$#" -gt 0 ]; do
 			confirm_profile_seen=1
 			shift 2
 			;;
+		--confirm-inventory)
+			[ "$#" -ge 2 ] || die "--confirm-inventory needs a value"
+			[ "$confirm_inventory_seen" -eq 0 ] || \
+				die "--confirm-inventory may be specified only once"
+			confirm_inventory=$2
+			confirm_inventory_seen=1
+			shift 2
+			;;
 		--session)
 			[ "$#" -ge 2 ] || die "--session needs a value"
 			[ "$session_seen" -eq 0 ] || die "--session may be specified only once"
@@ -194,12 +293,13 @@ done
 
 case "$command_name" in
 	self-test)
-		[ "$device_seen$confirm_device_seen$confirm_profile_seen$session_seen" = \
-			0000 ] || \
+		[ "$device_seen$confirm_device_seen$confirm_profile_seen$confirm_inventory_seen$session_seen" = \
+			00000 ] || \
 			die "self-test takes no arguments"
 		self_test
 		exit 0
 		;;
+	preflight) ;;
 	install) ;;
 	-h|--help|help|"")
 		usage
@@ -208,8 +308,8 @@ case "$command_name" in
 	*) die "unknown command: $command_name" ;;
 esac
 
-[ "$(id -u)" -eq 0 ] || die "install must run as root"
-[ -n "$session" ] || die "install requires --session"
+[ "$(id -u)" -eq 0 ] || die "helm-provision must run as root"
+[ -n "$session" ] || die "$command_name requires --session"
 session_supported "$session" || \
 	die "--session must be exactly 32 lowercase hexadecimal characters"
 marker_armed=1
@@ -224,26 +324,47 @@ bundle_profile=$(metadata_value PROFILE_ID) || \
 	die "bundle metadata must contain exactly one PROFILE_ID"
 profile_supported "$bundle_profile" || \
 	die "unsupported embedded bundle profile: $bundle_profile"
-[ -n "$device" ] || die "install requires --device"
+[ -n "$device" ] || die "$command_name requires --device"
 device_supported "$device" || \
 	die "refusing non-NVMe whole-disk path: $device"
-[ "$confirm_device" = "$device" ] || \
-	die "--confirm-device must exactly equal $device"
 [ "$confirm_profile" = "$bundle_profile" ] || \
 	die "--confirm-profile must exactly equal $bundle_profile"
 
-for required_command in helm-install helm-qspi-install mount umount sync
+case "$command_name" in
+	preflight)
+		[ "$confirm_device_seen$confirm_inventory_seen" = 00 ] || \
+			die "preflight does not accept destructive device or inventory confirmation"
+		;;
+	install)
+		[ "$confirm_device" = "$device" ] || \
+			die "--confirm-device must exactly equal $device"
+		if [ "$confirm_inventory_seen" -eq 1 ]; then
+			inventory_supported "$confirm_inventory" || \
+				die "--confirm-inventory must be exactly 64 lowercase hexadecimal characters"
+		fi
+		;;
+esac
+
+for required_command in helm-install helm-qspi-install mount sha256sum umount sync
 do
 	command -v "$required_command" >/dev/null 2>&1 || \
 		die "required recovery command is unavailable: $required_command"
 done
 
-printf 'HELM_PROVISION_STAGE preflight profile=%s device=%s\n' \
-	"$bundle_profile" "$device"
-# Both inspectors validate bundle identity, module EEPROM, target type, QSPI
-# geometry, and embedded payloads before the first persistent write.
-helm-install inspect --device "$device"
-helm-qspi-install inspect --device /dev/mtd0
+run_preflight
+if [ "$command_name" = preflight ]; then
+	succeeded=1
+	printf '\nHELM_PROVISION_PREFLIGHT_SUCCESS session=%s profile=%s device=%s inventory=%s\n' \
+		"$session" "$bundle_profile" "$device" "$inventory_fingerprint"
+	printf 'Preflight is complete. No persistent storage was written.\n'
+	exit 0
+fi
+
+if [ "$confirm_inventory_seen" -eq 1 ] && \
+	[ "$confirm_inventory" != "$inventory_fingerprint" ]
+then
+	die "NVMe inventory changed after confirmation; refusing persistent writes"
+fi
 
 printf 'HELM_PROVISION_STAGE nvme-install device=%s\n' "$device"
 helm-install install --device "$device" --confirm "$confirm_device"

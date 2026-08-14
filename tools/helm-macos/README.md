@@ -122,16 +122,26 @@ export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/qualified-p3767-0001/signed
 # Build Alpine once and produce all five exact-SKU bundles.
 ./tools/helm-macos/helm-macos family-matrix
 
+# Guided one-command customer provisioning.
+./helm
+
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 probe
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 verify
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 boot
 
+# Fully explicit noninteractive provisioning.
 profile=helm-orin-nx-8gb-r39.2
 ./tools/helm-macos/helm-macos --profile "$profile" provision \
   --device /dev/nvme0n1 \
   --confirm-device /dev/nvme0n1 \
   --confirm-profile "$profile"
 ```
+
+`./helm` is the guided path. It requires a controlling terminal, finds exactly
+one supported APX device, and maps its recovery PID to a profile. PID `7523`
+is shared by P3767-0003 and P3767-0005, so the tool requires one exact profile
+instead of guessing. It prompts for the target NVMe namespace, defaulting to
+`/dev/nvme0n1`, and rechecks the sole APX identity immediately before boot.
 
 `probe` is read-only. `verify` only reads local files. `boot` consumes the
 BootROM RCM session and boots Linux in RAM, but does not send a persistent
@@ -140,19 +150,25 @@ destructive, single-recovery-cable customer path: it first performs the same
 exact-bundle verification and volatile boot, excludes every serial device that
 existed before boot, and connects only when the new serial node's nearest IOKit
 `IOUSBHostDevice` parent exactly matches `0955:7020`, product
-`Helm Alpine Recovery Console`, and serial `helm-recovery`. A newly connected
-MCP2221 or any other `usbmodem` is rejected. Its serial transport uses Python's
-standard library; no `pyserial` or other package is required.
+`Helm Alpine Recovery Console`, and serial `helm-recovery`. Guided mode also
+requires the physical macOS USB `locationID` recorded for APX before boot. A
+newly connected MCP2221 or any other `usbmodem` is rejected; guided mode also
+rejects an exact recovery gadget on another port. Its serial transport uses
+Python's standard library; no `pyserial` or other package is required.
 
-The target-side `helm-provision` command repeats the exact device and profile
-guards, runs both existing installers in read-only inspect mode before writing,
-installs NVMe, mounts partition 1 for the mandatory full QSPI backup, installs
-and readback-verifies QSPI, then syncs and unmounts. The host accepts only a
-complete success line carrying its random session token and the requested
-profile/device. Connection readiness and the overall operation have finite
-timeouts. If the host loses the console after writes start, leave power
-connected and inspect the recovery UART; absence of verified success is never
-reported as success.
+In guided mode, target-side `helm-provision preflight` first reports the module,
+NVMe, QSPI geometry, and payload checks without writing. The host derives an
+exact confirmation phrase from a SHA-256 fingerprint binding the selected
+profile and NVMe path/model/serial/WWID/size; missing stable identity fields
+fail closed. The typed phrase contains its 12-hex prefix; only after that phrase
+matches does the host send `helm-provision install` with the full fingerprint.
+The target repeats the preflight and refuses changed inventory before writing.
+It then installs NVMe, mounts partition 1 for the mandatory full QSPI backup,
+installs and readback-verifies QSPI, syncs, and unmounts. The host accepts only
+a complete success line carrying its random session token and requested
+profile/device. Timeout or disconnect after writes start leaves state unknown;
+keep power connected and inspect the recovery console, using UART only if CDC
+is unavailable.
 
 After recovery re-enumerates the same cable as a CDC serial port, open the new
 `/dev/cu.usbmodem*` at 115200 baud. The onboard debug UART is an optional

@@ -233,6 +233,23 @@ configure_installed_boot()
 	}
 }
 
+validate_archive()
+{
+	[ -s "$archive" ] || die "rootfs archive is missing or empty: $archive"
+	command -v zstd >/dev/null 2>&1 || die "zstd is unavailable"
+	archive_listing=$(zstd -q -d -c "$archive" | tar -tf -)
+	printf '%s\n' "$archive_listing" | grep -qx './sbin/init' || \
+		die "archive has no /sbin/init"
+	printf '%s\n' "$archive_listing" | grep -qx './boot/Image' || \
+		die "archive has no /boot/Image"
+	printf '%s\n' "$archive_listing" | grep -qx './boot/extlinux/extlinux.conf' || \
+		die "archive has no /boot/extlinux/extlinux.conf"
+	printf '%s\n' "$archive_listing" | grep -qx "./boot/dtb/$boot_dtb" || \
+		die "archive has no selected P3767-$board_sku DTB: $boot_dtb"
+	printf '%s\n' "$archive_listing" | grep -qx './usr/lib/helm/BOOTAA64.EFI' || \
+		die "archive has no NVIDIA UEFI OS launcher"
+}
+
 self_test()
 {
 	for mapping in \
@@ -402,6 +419,8 @@ case "$command_name" in
 		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
 		load_boot_profile
 		validate_module
+		printf 'Validating Alpine payload...\n'
+		validate_archive
 		printf 'bundle: %s (P3767-%s)\n' "$bundle_profile" "$board_sku"
 		printf 'module: %s\n' "$module_part_number"
 		if [ -n "$device" ]; then
@@ -431,30 +450,18 @@ esac
 device=$(canonical_nvme "$device")
 [ "$confirm" = "$device" ] || \
 	die "--confirm must exactly equal $device"
-[ -s "$archive" ] || die "rootfs archive is missing or empty: $archive"
 load_boot_profile
 validate_module
 command -v sfdisk >/dev/null 2>&1 || die "sfdisk is unavailable"
 command -v mkfs.ext4 >/dev/null 2>&1 || die "mkfs.ext4 is unavailable"
 command -v mkfs.fat >/dev/null 2>&1 || die "mkfs.fat is unavailable"
-command -v zstd >/dev/null 2>&1 || die "zstd is unavailable"
 
 sectors=$(cat "/sys/class/block/${device##*/}/size")
 [ "$sectors" -ge 4194304 ] || die "NVMe is smaller than 2 GiB"
 assert_unmounted "$device"
 
 printf 'Validating Alpine payload...\n'
-archive_listing=$(zstd -q -d -c "$archive" | tar -tf -)
-printf '%s\n' "$archive_listing" | grep -qx './sbin/init' || \
-	die "archive has no /sbin/init"
-printf '%s\n' "$archive_listing" | grep -qx './boot/Image' || \
-	die "archive has no /boot/Image"
-printf '%s\n' "$archive_listing" | grep -qx './boot/extlinux/extlinux.conf' || \
-	die "archive has no /boot/extlinux/extlinux.conf"
-printf '%s\n' "$archive_listing" | grep -qx "./boot/dtb/$boot_dtb" || \
-	die "archive has no selected P3767-$board_sku DTB: $boot_dtb"
-printf '%s\n' "$archive_listing" | grep -qx './usr/lib/helm/BOOTAA64.EFI' || \
-	die "archive has no NVIDIA UEFI OS launcher"
+validate_archive
 
 device_summary "$device"
 printf '\nDESTROYING %s and installing Helm Alpine.\n' "$device"

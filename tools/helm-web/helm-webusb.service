@@ -1,0 +1,33 @@
+[Unit]
+Description=Helm browser flasher static server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/local/bin/node /opt/helm-webusb/current/server.mjs --host 127.0.0.1 --port 3190 --root /opt/helm-webusb/current
+Restart=on-failure
+RestartSec=2s
+UMask=0027
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/opt/helm-webusb
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

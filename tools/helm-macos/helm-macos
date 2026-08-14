@@ -3,10 +3,13 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+profile_explicit=0
+[ -z "${HELM_PROFILE:-}" ] || profile_explicit=1
 profile_name=${HELM_PROFILE:-helm-orin-nx-8gb-r39.2}
 if [ "${1:-}" = "--profile" ]; then
 	[ "$#" -ge 2 ] || { printf 'helm-macos: --profile needs a value\n' >&2; exit 2; }
 	profile_name=$2
+	profile_explicit=1
 	shift 2
 fi
 case "$profile_name" in
@@ -98,11 +101,13 @@ Native Apple-silicon macOS commands:
   probe       inspect the attached T234 recovery interface (read-only)
   verify      verify the six-file RCM bundle (read-only)
   boot        volatile RAM-boot the recovery installer (does not write storage)
-  provision   RAM-boot recovery, then install confirmed NVMe and QSPI over USB
+  provision   guided one-command recovery, NVMe, and QSPI provisioning over USB
   install-help show the guarded command to run on the Jetson recovery console
+  self-test   run source-only guided-command safety tests
 
-The default profile is helm-orin-nx-8gb-r39.2. No command here runs Docker, a
-VM, or an NVIDIA host executable. Direct catalogs come from
+The default profile for non-guided commands is helm-orin-nx-8gb-r39.2; guided
+provisioning derives it from the sole attached APX device. No command here runs
+Docker, a VM, or an NVIDIA host executable. Direct catalogs come from
 HELM_R39_SIGNED_DIR; family preparation derives fixed per-SKU catalogs from
 NVIDIA's official multi-spec BUP and HELM_R39_SEED_SIGNED_DIR.
 EOF
@@ -134,6 +139,196 @@ need_command()
 need_file()
 {
 	[ -s "$1" ] || die "missing required file: $1"
+}
+
+require_interactive_tty()
+{
+	[ -t 1 ] || \
+		die "guided provisioning requires terminal output so the target inventory is visible"
+	if ! exec 9<>/dev/tty; then
+		die "guided provisioning requires a controlling terminal; use the fully explicit provision arguments for automation"
+	fi
+	if ! [ -t 9 ]; then
+		exec 9>&-
+		die "guided provisioning requires a real controlling terminal"
+	fi
+	exec 9>&-
+}
+
+valid_nvme_device()
+{
+	case "$1" in
+		/dev/nvme[0-9]n[0-9]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_usb_location()
+{
+	case "$1" in
+		0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) \
+			return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+profiles_for_usb_pid()
+{
+	wanted_pid=$1
+	for definition in "$script_dir"/profiles/*.conf; do
+		(
+			# shellcheck disable=SC1090
+			. "$definition"
+			if [ "$profile_usb_pid" = "$wanted_pid" ]; then
+				printf '%s\n' "$profile_id"
+			fi
+		)
+	done
+}
+
+profile_summary()
+{
+	definition=$script_dir/profiles/$1.conf
+	[ -r "$definition" ] || die "profile definition is missing: $definition"
+	(
+		# shellcheck disable=SC1090
+		. "$definition"
+		printf '  %s — %s\n' "$profile_id" "$profile_board"
+	)
+}
+
+apx_pid_from_probe()
+{
+	awk '
+		/^Found NVIDIA T234 APX 0955:(7323|7423|7523|7623) \(.+\)$/ {
+			value = $0
+			sub(/^Found NVIDIA T234 APX 0955:/, "", value)
+			sub(/ .*/, "", value)
+			pid = "0x" value
+			count++
+		}
+		END {
+			if (count != 1)
+				exit 1
+			print pid
+		}
+	'
+}
+
+probe_supported_apx()
+{
+	probe_output=
+	if ! probe_output=$("$loader" probe 2>&1); then
+		printf '%s\n' "$probe_output" >&2
+		die "connect exactly one supported Helm module in force recovery"
+	fi
+	detected_pid=$(printf '%s\n' "$probe_output" | apx_pid_from_probe) || {
+		printf '%s\n' "$probe_output" >&2
+		die "could not identify exactly one supported Helm APX product"
+	}
+	printf '%s\n' "$detected_pid"
+}
+
+guided_provision()
+{
+	require_interactive_tty
+	require_macos
+	need_command make
+	need_command pkg-config
+	need_command python3
+	need_file "$provision_console"
+	[ -x "$loader" ] || build_bootkit
+
+	detected_pid=$(probe_supported_apx)
+	detected_location=$(python3 "$provision_console" --apx-location "$detected_pid")
+	valid_usb_location "$detected_location" || \
+		die "could not bind the APX module to a physical macOS USB location"
+	candidates=$(profiles_for_usb_pid "$detected_pid")
+	candidate_count=$(printf '%s\n' "$candidates" | awk 'NF { count++ } END { print count + 0 }')
+	[ "$candidate_count" -gt 0 ] || die "no profile maps to recovery PID $detected_pid"
+
+	if [ "$profile_explicit" -eq 1 ]; then
+		[ "$profile_usb_pid" = "$detected_pid" ] || \
+			die "selected $profile_id expects USB $profile_usb_pid, but the attached module is $detected_pid"
+		selected_profile=$profile_id
+	else
+		case "$candidate_count" in
+			1) selected_profile=$candidates ;;
+			2)
+				printf '\nRecovery PID 0955:%s is shared by two module SKUs.\n' \
+					"${detected_pid#0x}" > /dev/tty
+				printf 'Read the P3767 module marking and type one exact profile:\n' > /dev/tty
+				for candidate in $candidates; do
+					profile_summary "$candidate" > /dev/tty
+				done
+				printf '> ' > /dev/tty
+				IFS= read -r selected_profile < /dev/tty || \
+					die "profile selection ended; no hardware was changed"
+				profile_allowed=0
+				for candidate in $candidates; do
+					[ "$selected_profile" != "$candidate" ] || profile_allowed=1
+				done
+				[ "$profile_allowed" -eq 1 ] || \
+					die "profile selection must exactly match one listed profile"
+				;;
+			*) die "multiple attached profiles are ambiguous; connect only one board" ;;
+		esac
+	fi
+
+	printf '\nDetected recovery module:\n' > /dev/tty
+	profile_summary "$selected_profile" > /dev/tty
+	printf 'Target NVMe namespace [/dev/nvme0n1]: ' > /dev/tty
+	IFS= read -r selected_device < /dev/tty || \
+		die "NVMe selection ended; no hardware was changed"
+	[ -n "$selected_device" ] || selected_device=/dev/nvme0n1
+	valid_nvme_device "$selected_device" || \
+		die "target must be one whole NVMe namespace such as /dev/nvme0n1"
+
+	cat > /dev/tty <<EOF
+
+Helm will now RAM-boot recovery without writing storage. Recovery will inspect
+the module, $selected_device, QSPI geometry, and every embedded payload. Only
+after that inventory is displayed will it ask for destructive confirmation.
+
+EOF
+	exec "$script_dir/helm-macos" --profile "$selected_profile" provision \
+		--guided --device "$selected_device" \
+		--expected-location "$detected_location"
+}
+
+helm_macos_self_test()
+{
+	[ "$(printf '%s\n' \
+		'Found NVIDIA T234 APX 0955:7423 (Jetson Orin NX 8GB (P3767-0001))' \
+		'Interface 0, bulk OUT 0x01, bulk IN 0x81' | apx_pid_from_probe)" = 0x7423 ]
+	if printf '%s\n' \
+		'Found NVIDIA T234 APX 0955:7423 (Jetson Orin NX 8GB (P3767-0001))' \
+		'Found NVIDIA T234 APX 0955:7623 (Jetson Orin Nano 4GB (P3767-0004))' | \
+		apx_pid_from_probe >/dev/null 2>&1
+	then
+		return 1
+	fi
+	if printf '%s\n' 'Found NVIDIA T234 APX 0955:ffff (unknown)' | \
+		apx_pid_from_probe >/dev/null 2>&1
+	then
+		return 1
+	fi
+	[ "$(profiles_for_usb_pid 0x7323 | wc -l | tr -d ' ')" -eq 1 ]
+	[ "$(profiles_for_usb_pid 0x7423 | wc -l | tr -d ' ')" -eq 1 ]
+	[ "$(profiles_for_usb_pid 0x7623 | wc -l | tr -d ' ')" -eq 1 ]
+	[ "$(profiles_for_usb_pid 0x7523 | wc -l | tr -d ' ')" -eq 2 ]
+	profiles_for_usb_pid 0x7523 | grep -qx helm-orin-nano-8gb-r39.2
+	profiles_for_usb_pid 0x7523 | grep -qx helm-orin-nano-8gb-sd-r39.2
+	valid_nvme_device /dev/nvme0n1
+	valid_nvme_device /dev/nvme9n8
+	! valid_nvme_device /dev/nvme0n1p1
+	! valid_nvme_device /dev/nvme00n1
+	! valid_nvme_device /dev/sda
+	valid_usb_location 0x01230000
+	! valid_usb_location 0x0123000
+	! valid_usb_location 0x0123000A
+	! valid_usb_location 01230000
+	printf 'helm-macos: guided-command safety tests passed\n'
 }
 
 require_macos()
@@ -662,12 +857,30 @@ provision()
 {
 	device=
 	device_seen=0
+	guided=0
+	guided_seen=0
+	expected_location=
+	expected_location_seen=0
 	confirm_device=
 	confirm_device_seen=0
 	confirm_profile=
 	confirm_profile_seen=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
+			--guided)
+				[ "$guided_seen" -eq 0 ] || die "--guided may be specified only once"
+				guided=1
+				guided_seen=1
+				shift
+				;;
+			--expected-location)
+				[ "$#" -ge 2 ] || die "--expected-location needs a value"
+				[ "$expected_location_seen" -eq 0 ] || \
+					die "--expected-location may be specified only once"
+				expected_location=$2
+				expected_location_seen=1
+				shift 2
+				;;
 			--device)
 				[ "$#" -ge 2 ] || die "--device needs a value"
 				[ "$device_seen" -eq 0 ] || die "--device may be specified only once"
@@ -693,14 +906,21 @@ provision()
 				;;
 			-h|--help)
 				cat <<EOF
+usage: $0 provision
+
+Guided mode detects one APX module, RAM-boots recovery, displays read-only
+target inventory, and asks for exact destructive confirmation before install.
+
+Automation:
 usage: $0 --profile PROFILE provision \\
   --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \\
   --confirm-profile PROFILE
 
 This verifies and RAM-boots the exact profile bundle, waits for the new recovery
 CDC console while excluding every pre-existing /dev/cu.usbmodem* device, then
-runs the guarded target-side NVMe + QSPI provisioner. It is destructive only
-after all three values match exactly.
+runs the guarded target-side NVMe + QSPI provisioner. Explicit automation is
+destructive only after all three values match exactly; guided mode confirms the
+post-boot inventory instead.
 EOF
 				exit 0
 				;;
@@ -708,19 +928,35 @@ EOF
 		esac
 	done
 	[ -n "$device" ] || die "provision requires --device"
-	case "$device" in
-		/dev/nvme[0-9]n[0-9]) ;;
-		*) die "provision only accepts a whole NVMe namespace: $device" ;;
-	esac
-	[ "$confirm_device" = "$device" ] || \
-		die "--confirm-device must exactly equal $device"
-	[ "$confirm_profile" = "$profile_id" ] || \
-		die "--confirm-profile must exactly equal $profile_id"
+	valid_nvme_device "$device" || \
+		die "provision only accepts a whole NVMe namespace: $device"
+	if [ "$guided" -eq 1 ]; then
+		require_interactive_tty
+		[ "$confirm_device_seen$confirm_profile_seen" = 00 ] || \
+			die "guided mode obtains confirmation after target inventory; do not pass confirmation flags"
+		valid_usb_location "$expected_location" || \
+			die "guided mode requires the original APX physical USB location"
+	else
+		[ "$expected_location_seen" -eq 0 ] || \
+			die "--expected-location is internal to guided mode"
+		[ "$confirm_device" = "$device" ] || \
+			die "--confirm-device must exactly equal $device"
+		[ "$confirm_profile" = "$profile_id" ] || \
+			die "--confirm-profile must exactly equal $profile_id"
+	fi
 
 	require_macos
 	need_command python3
 	need_file "$provision_console"
 	verify
+	if [ "$guided" -eq 1 ]; then
+		detected_pid=$(probe_supported_apx)
+		[ "$detected_pid" = "$profile_usb_pid" ] || \
+			die "attached APX identity changed before boot: expected $profile_usb_pid, found $detected_pid"
+		current_location=$(python3 "$provision_console" --apx-location "$detected_pid")
+		[ "$current_location" = "$expected_location" ] || \
+			die "attached APX physical USB location changed before boot"
+	fi
 	existing_modems=$(mktemp "${TMPDIR:-/tmp}/helm-existing-modems.XXXXXX")
 	trap 'rm -f "$existing_modems"' EXIT HUP INT TERM
 	for modem in /dev/cu.usbmodem*; do
@@ -741,7 +977,11 @@ EOF
 		--device "$device" \
 		--connect-timeout "${HELM_PROVISION_CONNECT_TIMEOUT:-180}" \
 		--ready-timeout "${HELM_PROVISION_READY_TIMEOUT:-30}" \
+		--preflight-timeout "${HELM_PROVISION_PREFLIGHT_TIMEOUT:-300}" \
 		--operation-timeout "${HELM_PROVISION_OPERATION_TIMEOUT:-1800}"
+	if [ "$guided" -eq 1 ]; then
+		set -- "$@" --guided --expected-location "$expected_location"
+	fi
 	while IFS= read -r modem; do
 		[ -n "$modem" ] || continue
 		set -- "$@" --exclude "$modem"
@@ -791,8 +1031,13 @@ case "$command_name" in
 		;;
 	provision)
 		shift
-		provision "$@"
+		if [ "$#" -eq 0 ]; then
+			guided_provision
+		else
+			provision "$@"
+		fi
 		;;
+	self-test) helm_macos_self_test ;;
 	install-help)
 		cat <<EOF
 On the Helm debug UART after RAM recovery boots:
@@ -807,6 +1052,10 @@ On the Helm debug UART after RAM recovery boots:
     --confirm $profile_id
 
 Or run the same guarded sequence from the Mac over the recovery USB cable:
+
+  ./helm
+
+For noninteractive automation:
 
   $0 --profile $profile_id provision \
     --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \

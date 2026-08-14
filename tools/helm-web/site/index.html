@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="Provision a Diode Helm from desktop Chrome over one USB cable.">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Helm Browser Flasher">
+    <meta property="og:description" content="One cable. Guarded provisioning for Diode Helm.">
+    <meta property="og:url" content="https://preview.example.invalid:8443/">
+    <meta property="og:image" content="https://preview.example.invalid:8443/og.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <title>Helm Browser Flasher</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.mjs"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="./" aria-label="Helm flasher home">
+        <span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>HELM</span>
+      </a>
+      <div class="header-meta">
+        <span class="preview-pill">Developer preview</span>
+        <span>Desktop Chrome / Chromium</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">USB provisioning</p>
+        <h1 id="page-title">A clean start,<br>straight from the browser.</h1>
+        <p class="hero-copy">
+          RAM-boot recovery, inspect the installed NVMe, then provision Helm.
+          One data cable, two deliberate browser grants, no host-side installer.
+        </p>
+      </section>
+
+      <div class="workspace">
+        <aside class="rail" aria-label="Provisioning readiness">
+          <section class="rail-card readiness-card">
+            <p class="section-label">Browser readiness</p>
+            <ul class="checks" id="feature-checks">
+              <li data-feature="secure"><span class="check-dot" aria-hidden="true"></span><span>Trusted HTTPS</span><strong>Checking</strong></li>
+              <li data-feature="usb"><span class="check-dot" aria-hidden="true"></span><span>WebUSB</span><strong>Checking</strong></li>
+              <li data-feature="serial"><span class="check-dot" aria-hidden="true"></span><span>Web Serial</span><strong>Checking</strong></li>
+              <li data-feature="catalog"><span class="check-dot" aria-hidden="true"></span><span>Verified bundle catalog</span><strong>Loading</strong></li>
+            </ul>
+          </section>
+
+          <section class="rail-card cable-card">
+            <p class="section-label">Before you begin</p>
+            <h2>Connect exactly one Helm.</h2>
+            <p>
+              Disconnect every other Jetson or APX device. Keep Helm powered and
+              leave the USB data cable attached for the whole run.
+            </p>
+            <label class="acknowledgement">
+              <input id="single-board-ack" type="checkbox">
+              <span>I have exactly one Helm connected</span>
+            </label>
+          </section>
+
+          <section class="rail-card assurance-card">
+            <p class="section-label">Write boundary</p>
+            <p>
+              Bundle verification, APX transfer, RAM boot, and preflight do not
+              write persistent storage. Erasure is only requested after the exact
+              final phrase and an explicit click.
+            </p>
+          </section>
+        </aside>
+
+        <section class="flow" aria-label="Helm provisioning workflow">
+          <div id="compatibility-alert" class="alert alert-error" role="alert" hidden>
+            <div>
+              <strong>This browser cannot provision Helm.</strong>
+              <p id="compatibility-message"></p>
+            </div>
+          </div>
+
+          <section class="status-panel" aria-live="polite" aria-atomic="true">
+            <div>
+              <p class="section-label">Current state</p>
+              <h2 id="status-title">Checking this browser</h2>
+              <p id="status-detail">Confirming secure USB and serial support.</p>
+            </div>
+            <span id="status-chip" class="status-chip" data-tone="working">
+              <span aria-hidden="true"></span>Checking
+            </span>
+          </section>
+
+          <section id="progress-panel" class="progress-panel" aria-live="polite" hidden>
+            <div class="progress-copy">
+              <strong id="progress-title">Preparing</strong>
+              <span id="progress-percent">0%</span>
+            </div>
+            <progress id="progress-bar" max="100" value="0">0%</progress>
+            <p id="progress-detail"></p>
+          </section>
+
+          <ol class="steps">
+            <li class="step-card" id="step-prepare" data-state="current">
+              <div class="step-index" aria-hidden="true">01</div>
+              <div class="step-body">
+                <div class="step-heading">
+                  <div>
+                    <p class="section-label">Profile + files</p>
+                    <h2>Prepare the RAM-boot bundle</h2>
+                  </div>
+                  <span class="step-state">Ready</span>
+                </div>
+                <p class="step-copy">
+                  Select the exact module SKU. Files are downloaded and checked
+                  against both the catalog and the bundle's own SHA-256 manifest
+                  before the browser asks for USB access.
+                </p>
+
+                <label class="field-label" for="profile-select">Helm module profile</label>
+                <select id="profile-select" disabled>
+                  <option value="">Loading profiles…</option>
+                </select>
+                <div id="shared-pid-note" class="inline-note note-warning" hidden>
+                  <strong>SKU choice required.</strong>
+                  <span>
+                    P3767-0003 and P3767-0005 share the same APX USB identity, so
+                    the browser cannot distinguish them. Verify the module label.
+                  </span>
+                </div>
+
+                <div class="action-row">
+                  <button id="prepare-button" class="button button-primary" type="button" disabled>
+                    Download + verify bundle
+                  </button>
+                  <span id="bundle-summary" class="action-hint">No profile selected</span>
+                </div>
+              </div>
+            </li>
+
+            <li class="step-card" id="step-boot" data-state="locked">
+              <div class="step-index" aria-hidden="true">02</div>
+              <div class="step-body">
+                <div class="step-heading">
+                  <div>
+                    <p class="section-label">Browser grant one</p>
+                    <h2>Connect APX + RAM boot</h2>
+                  </div>
+                  <span class="step-state">Locked</span>
+                </div>
+                <p class="step-copy">
+                  Put Helm in force-recovery mode. The browser chooser must show
+                  an NVIDIA APX device. The selected USB identity is checked against
+                  the prepared profile before any bytes are sent.
+                </p>
+                <div class="inline-note">
+                  <strong>Volatile operation</strong>
+                  <span>This stage only loads signed recovery software into RAM.</span>
+                </div>
+                <div class="action-row">
+                  <button id="boot-button" class="button button-primary" type="button" disabled>
+                    Choose APX device + RAM boot
+                  </button>
+                  <span class="action-hint">Keep the cable connected during re-enumeration</span>
+                </div>
+              </div>
+            </li>
+
+            <li class="step-card" id="step-recovery" data-state="locked">
+              <div class="step-index" aria-hidden="true">03</div>
+              <div class="step-body">
+                <div class="step-heading">
+                  <div>
+                    <p class="section-label">Browser grant two</p>
+                    <h2>Connect recovery + inspect</h2>
+                  </div>
+                  <span class="step-state">Locked</span>
+                </div>
+                <p class="step-copy">
+                  After Helm reappears as recovery USB, grant access to its serial
+                  console. A read-only preflight verifies the profile and fingerprints
+                  <code>/dev/nvme0n1</code>.
+                </p>
+                <div class="action-row">
+                  <button id="recovery-button" class="button button-primary" type="button" disabled>
+                    Choose recovery port + preflight
+                  </button>
+                  <span class="action-hint">Select only “Helm recovery 0955:7020”</span>
+                </div>
+              </div>
+            </li>
+
+            <li class="step-card danger-card" id="step-install" data-state="locked">
+              <div class="step-index" aria-hidden="true">04</div>
+              <div class="step-body">
+                <div class="step-heading">
+                  <div>
+                    <p class="section-label">Persistent write</p>
+                    <h2>Erase NVMe + flash QSPI</h2>
+                  </div>
+                  <span class="step-state">Locked</span>
+                </div>
+                <p class="step-copy">
+                  This is the only destructive step. Check the target fingerprint,
+                  type the displayed phrase byte-for-byte, then click the red button.
+                  It never starts automatically.
+                </p>
+
+                <dl class="inventory" id="inventory-panel" hidden>
+                  <div>
+                    <dt>Target</dt>
+                    <dd id="inventory-device">—</dd>
+                  </div>
+                  <div>
+                    <dt>Profile</dt>
+                    <dd id="inventory-profile">—</dd>
+                  </div>
+                  <div class="inventory-hash-row">
+                    <dt>NVMe fingerprint</dt>
+                    <dd id="inventory-hash">—</dd>
+                  </div>
+                </dl>
+
+                <div id="confirmation-panel" class="confirmation" hidden>
+                  <label class="field-label" for="confirmation-input">Type this exact phrase</label>
+                  <code id="confirmation-phrase" class="confirmation-phrase"></code>
+                  <input
+                    id="confirmation-input"
+                    type="text"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    spellcheck="false"
+                    aria-describedby="confirmation-help"
+                  >
+                  <p id="confirmation-help" class="field-help">Spaces, profile, device, and fingerprint must all match.</p>
+                </div>
+
+                <div class="danger-action">
+                  <button id="install-button" class="button button-danger" type="button" disabled>
+                    Erase NVMe + flash QSPI
+                  </button>
+                  <p>
+                    Once clicked, a disconnect or timeout leaves persistent state
+                    unknown. Keep Helm powered for recovery and do not retry blindly.
+                  </p>
+                </div>
+              </div>
+            </li>
+          </ol>
+
+          <details class="console" open>
+            <summary>
+              <span>Session log</span>
+              <span id="log-count">0 entries</span>
+            </summary>
+            <pre id="session-log" tabindex="0" aria-label="Provisioning session log"></pre>
+          </details>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <span>Diode · Helm</span>
+      <span>Do not disconnect power after persistent writes begin.</span>
+    </footer>
+  </body>
+</html>

@@ -49,6 +49,10 @@ Rosetta, or NVIDIA Linux host executable.
   every catalog payload, and produces its fixed 64 MiB raw QSPI image.
 - Recovery PID matching and target-side module EEPROM matching prevent a
   selected profile from being used on a different module SKU.
+- A dependency-free browser flasher verifies and RAM-boots the same bundles
+  through WebUSB, then drives the guarded recovery preflight/install protocol
+  through Web Serial. It is a developer preview pending physical browser
+  qualification; the native macOS path remains the qualified path.
 
 All five per-SKU catalogs, QSPI images, and recovery bundles are structurally
 verified on macOS. P3767-0001 additionally reproduces the qualified recovery
@@ -115,29 +119,64 @@ For the customer path, connect one supported Helm directly to the Mac through
 its recovery USB port, put it in force recovery, and run one guarded command:
 
 ```sh
+./helm
+```
+
+The guided command requires a real controlling terminal and read-only probes
+exactly one supported APX device. It selects the profile automatically for the
+unique recovery PIDs. P3767-0003 and P3767-0005 share PID `0955:7523`, so that
+case never defaults: it requires the exact profile printed on the module. The
+target NVMe prompt defaults to `/dev/nvme0n1`.
+
+The selected bundle is verified before a volatile RAM boot. The same USB port
+then re-enumerates as recovery CDC; the host requires the macOS physical USB
+location recorded in APX mode plus VID:PID `0955:7020`, product
+`Helm Alpine Recovery Console`, and serial `helm-recovery`, rejecting MCP2221,
+other serial devices, and a recovery gadget on another port. Recovery displays
+read-only module, NVMe, QSPI-geometry, and payload inspection first. It binds
+the observed NVMe model, serial, WWID, size, device path, and profile to a
+SHA-256 inventory fingerprint and requires an exact typed phrase containing
+its 12-hex prefix before sending the full fingerprint with the install command.
+Cancellation at this point has written no persistent storage.
+
+After confirmation, the target repeats every preflight and refuses if the NVMe
+inventory changed. It installs Alpine, saves the complete pre-write QSPI backup
+on the new root filesystem, writes QSPI, verifies a full readback, syncs,
+unmounts, and emits a session-bound success marker. A timeout, disconnect,
+target error, or mismatched marker is a failure, never inferred success. Leave
+power connected unless the command prints verified success.
+
+Guided mode fails closed if the NVMe does not expose those stable identity
+fields. The fully explicit form remains available for noninteractive automation:
+
+```sh
 profile=helm-orin-nx-8gb-r39.2
 ./tools/helm-macos/helm-macos --profile "$profile" provision \
-  --device /dev/nvme0n1 \
-  --confirm-device /dev/nvme0n1 \
+  --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \
   --confirm-profile "$profile"
 ```
 
-`provision` verifies the exact local profile bundle, records all existing
-`/dev/cu.usbmodem*` devices, volatile-boots recovery, then resolves every new
-serial node through IOKit. It accepts only a USB parent with VID:PID
-`0955:7020`, product `Helm Alpine Recovery Console`, and serial
-`helm-recovery`, so an MCP2221 UART connected after boot is also rejected. It
-then streams the complete target log. The target performs read-only NVMe,
-module EEPROM, QSPI-geometry, and payload preflight before it formats the
-confirmed NVMe. It
-then mounts partition 1, saves the complete pre-write QSPI backup there, writes
-QSPI, verifies a full readback, syncs, unmounts, and emits a session-bound
-success marker. A timeout, disconnect, target error, or mismatched marker is a
-failure, never an inferred success.
+## Browser flasher preview
 
-The three values are intentionally repetitive: the whole-disk path must match
-its confirmation and the profile confirmation must match the selected bundle.
-At the end, leave power connected unless the command prints verified success.
+The tailnet-only browser prototype is available in current desktop Chrome or
+Chromium at
+<https://preview.example.invalid:8443/>. Connect exactly one Helm,
+keep it powered, and use its recovery USB port. It is still one physical cable,
+but the browser asks once for APX WebUSB access and again for the re-enumerated
+recovery Web Serial port.
+
+The page downloads only the selected exact-SKU bundle, verifies every file
+against the same-origin catalog and embedded SHA256SUMS, and performs a
+volatile RAM boot. It then runs the same target-side read-only module/NVMe/QSPI
+preflight and requires the same inventory-bound exact phrase before any
+persistent write. P3767-0003 and P3767-0005 still require an explicit module
+choice because both use PID `0955:7523`.
+
+This is not yet the qualified customer path: a real T234 BootROM-to-MB1
+WebUSB permission handoff still needs physical Chrome testing. A public rollout
+also needs its own trusted origin (for example `flash.diode.com`); the current
+host is private to the tailnet, and the raw `192.0.2.1` URL is not a valid
+WebUSB HTTPS origin.
 
 For manual recovery or diagnosis, the underlying non-writing steps remain:
 
@@ -187,11 +226,14 @@ a physical P3767-0001 Helm without UART.
 
 ## Repository layout
 
+- `helm`: zero-argument guided provisioning entry point
 - `os/alpine`: native image build, OpenRC system, recovery initramfs, installer,
   Helm device tree, and peripheral helpers
 - `tools/apx-macos`: read-only native APX discovery and inspection
 - `tools/helm-macos`: native build/bundle/RCM/QSPI orchestration and owned
   image-format builders
+- `tools/helm-web`: WebUSB RCM transport, guarded Web Serial protocol, static
+  flasher, deterministic site packager, and isolated static server
 
 See [`os/alpine/README.md`](os/alpine/README.md) for image contents and first
 boot behavior. See the

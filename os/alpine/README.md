@@ -81,19 +81,32 @@ The native Mac wrapper can drive the complete guarded sequence over this same
 recovery cable:
 
 ```sh
+./helm
+```
+
+This guided path RAM-boots first, runs `helm-provision preflight`, and displays
+the module, selected NVMe, QSPI geometry, and embedded payload validation while
+storage is still untouched. It binds the selected profile and NVMe
+path/model/serial/WWID/size to a SHA-256 fingerprint and fails if those stable
+identity fields are unavailable. Only an exact typed phrase
+containing its 12-hex prefix authorizes `helm-provision install`; the host sends
+the full fingerprint, and install repeats the preflight and refuses changed
+inventory before writing.
+
+For noninteractive automation, retain every explicit confirmation:
+
+```sh
 profile=helm-orin-nx-8gb-r39.2
 ./tools/helm-macos/helm-macos --profile "$profile" provision \
   --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \
   --confirm-profile "$profile"
 ```
 
-It invokes `helm-provision` only after the RAM recovery CDC console answers a
-session-token probe. `helm-provision` requires the exact bundle profile and
-whole-device confirmation, preflights `helm-install` and `helm-qspi-install`
-without writes, then performs NVMe installation followed by the backed-up and
-readback-verified QSPI installation. It syncs and unmounts before printing its
-token-bound success marker. The recovery init script never invokes this command
-automatically, so plain RAM recovery remains non-writing.
+The wrapper invokes `helm-provision` only after the RAM recovery CDC console
+answers a session-token probe. Guided mode additionally requires its macOS
+physical USB `locationID` to match the APX device recorded before boot. The
+recovery init script never invokes it automatically, so plain RAM recovery
+remains non-writing.
 
 Recovery switches USB2 pad 0 through the stable
 `/sys/class/usb_role/*/role` class link and verifies `device` mode both before
