@@ -14,6 +14,7 @@ import { WebSerialTransport } from "./modules/web-serial-transport.mjs";
 const TARGET_DEVICE = "/dev/nvme0n1";
 const SHARED_APX_PRODUCT_ID = 0x7523;
 const MAXIMUM_LOG_LENGTH = 200_000;
+const APPLICATION_BASE_URL = new URL(".", import.meta.url);
 const BUNDLE_NAMES = Object.freeze([
   ...RCM_ARTIFACTS.map(({ name }) => name),
   "PROFILE",
@@ -201,7 +202,7 @@ function sameOriginUrl(value, description) {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`catalog is missing ${description}`);
   }
-  const url = new URL(value, window.location.href);
+  const url = new URL(value, APPLICATION_BASE_URL);
   if (url.origin !== window.location.origin || url.username !== "" || url.password !== "") {
     throw new Error(`${description} must stay on this HTTPS origin`);
   }
@@ -720,7 +721,7 @@ async function initialize() {
   }
 
   try {
-    const response = await fetch("./catalog.json", {
+    const response = await fetch(new URL("catalog.json", APPLICATION_BASE_URL), {
       cache: "no-store",
       credentials: "same-origin",
       redirect: "error",

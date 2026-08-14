@@ -8,7 +8,7 @@ preflight and, only after an exact typed phrase, the target-side NVMe/QSPI
 provisioner.
 
 The tailnet-only developer preview is hosted at
-<https://preview.example.invalid:8443/>. A public customer release
+<https://preview.example.invalid/helm>. A public customer release
 needs a dedicated public HTTPS origin such as `flash.diode.com`; the raw
 `192.0.2.1` address cannot present the certificate needed for WebUSB.
 
@@ -23,7 +23,7 @@ tools/helm-web/prepare-site.py
 node tools/helm-web/server.mjs --root build/helm-web/site
 ```
 
-Open <http://127.0.0.1:3190/> for local development. The packager requires the
+Open <http://127.0.0.1:3190/helm/> for local development. The packager requires the
 exact five profile directories, exact file sets and PROFILE schemas, and a
 valid SHA256SUMS entry for every payload. It rehashes the payloads before
 generating `catalog.json`. The server binds only to localhost by default,

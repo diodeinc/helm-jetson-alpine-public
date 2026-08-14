@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 3190;
 const DEFAULT_ROOT = path.resolve("build/helm-web/site");
+const MOUNT_PATH = "/helm";
 const SECURITY_HEADERS = Object.freeze({
   "Content-Security-Policy": [
     "default-src 'none'",
@@ -92,9 +93,15 @@ export async function resolveRequestPath(root, requestTarget) {
   } catch {
     throw new RequestError(400, "invalid request URL");
   }
+  let requestPath = url.pathname;
+  if (requestPath === MOUNT_PATH) {
+    requestPath = "/";
+  } else if (requestPath.startsWith(`${MOUNT_PATH}/`)) {
+    requestPath = requestPath.slice(MOUNT_PATH.length);
+  }
   let decoded;
   try {
-    decoded = decodeURIComponent(url.pathname);
+    decoded = decodeURIComponent(requestPath);
   } catch {
     throw new RequestError(400, "invalid URL encoding");
   }
@@ -318,7 +325,7 @@ async function run() {
   });
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : options.port;
-  process.stdout.write(`helm-web: serving ${path.resolve(options.root)} on http://${options.host}:${port}/\n`);
+  process.stdout.write(`helm-web: serving ${path.resolve(options.root)} on http://${options.host}:${port}${MOUNT_PATH}/\n`);
 
   const stop = () => {
     server.close((error) => {

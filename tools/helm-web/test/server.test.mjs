@@ -108,6 +108,14 @@ test("static server provides safe GET, HEAD, and range responses", async () => {
     assert.match(index.headers["permissions-policy"], /serial=\(self\)/);
     assert.equal(index.headers["cache-control"], "no-store");
 
+    const mountedIndex = await rawRequest(base, "/helm");
+    assert.equal(mountedIndex.status, 200);
+    assert.equal(mountedIndex.body.toString(), "<!doctype html>\n");
+
+    const mountedCatalog = await rawRequest(base, "/helm/catalog.json");
+    assert.equal(mountedCatalog.status, 200);
+    assert.equal(mountedCatalog.body.toString(), '{"version":1}\n');
+
     const socialImage = await rawRequest(base, "/og.png", { method: "HEAD" });
     assert.equal(socialImage.status, 200);
     assert.equal(socialImage.headers["content-type"], "image/png");
@@ -124,6 +132,12 @@ test("static server provides safe GET, HEAD, and range responses", async () => {
     assert.equal(range.headers["content-range"], "bytes 2-5/10");
     assert.equal(range.headers["content-length"], "4");
     assert.equal(range.body.toString(), "2345");
+
+    const mountedRange = await rawRequest(base, "/helm/bundles/blob.bin", {
+      headers: { Range: "bytes=2-5" },
+    });
+    assert.equal(mountedRange.status, 206);
+    assert.equal(mountedRange.body.toString(), "2345");
 
     const suffix = await rawRequest(base, "/bundles/blob.bin", {
       headers: { Range: "bytes=-3" },

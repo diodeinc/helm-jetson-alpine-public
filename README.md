@@ -160,7 +160,7 @@ profile=helm-orin-nx-8gb-r39.2
 
 The tailnet-only browser prototype is available in current desktop Chrome or
 Chromium at
-<https://preview.example.invalid:8443/>. Connect exactly one Helm,
+<https://preview.example.invalid/helm>. Connect exactly one Helm,
 keep it powered, and use its recovery USB port. It is still one physical cable,
 but the browser asks once for APX WebUSB access and again for the re-enumerated
 recovery Web Serial port.
