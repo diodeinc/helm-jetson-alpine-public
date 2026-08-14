@@ -3,11 +3,20 @@ set -eu
 
 program=${0##*/}
 default_archive=/opt/helm/payload/helm-rootfs.tar.zst
+metadata=/opt/helm/payload/helm-profile
 device=
 confirm=
 archive=$default_archive
-mount_dir=/run/helm-install/root
-mounted=0
+root_mount_dir=/run/helm-install/root
+esp_mount_dir=/run/helm-install/esp
+root_mounted=0
+esp_mounted=0
+bundle_profile=
+board_sku=
+boot_label=
+boot_dtb=
+expected_profile=
+module_part_number=
 
 usage()
 {
@@ -16,9 +25,11 @@ usage:
   $program inspect [--device /dev/nvme0n1]
   $program install --device /dev/nvme0n1 \\
     --confirm /dev/nvme0n1 [--archive PATH]
+  $program self-test
 
 inspect is read-only. install destroys the selected NVMe's partition table and
-filesystems. --confirm must exactly match --device.
+filesystems. --confirm must exactly match --device. The install bundle must
+identify a supported P3767 BOARD_SKU so its premerged Helm DTB can be selected.
 EOF
 }
 
@@ -30,11 +41,277 @@ die()
 
 cleanup()
 {
-	if [ "$mounted" -eq 1 ]; then
+	if [ "$esp_mounted" -eq 1 ]; then
 		sync || :
-		umount "$mount_dir" || :
-		mounted=0
+		umount "$esp_mount_dir" || :
+		esp_mounted=0
 	fi
+	if [ "$root_mounted" -eq 1 ]; then
+		sync || :
+		umount "$root_mount_dir" || :
+		root_mounted=0
+	fi
+}
+
+metadata_value()
+{
+	key=$1
+	awk -F= -v key="$key" '
+		$1 == key {
+			count++
+			sub(/^[^=]*=/, "")
+			value = $0
+		}
+		END {
+			if (count != 1)
+				exit 1
+			print value
+		}
+	' "$metadata"
+}
+
+select_boot_profile()
+{
+	board_sku=$1
+	case "$board_sku" in
+		0000)
+			boot_label=helm-orin-nx-16gb
+			boot_dtb=helm-p3767-0000.dtb
+			expected_profile=helm-orin-nx-16gb-r39.2
+			;;
+		0001)
+			boot_label=helm-orin-nx-8gb
+			boot_dtb=helm-p3767-0001.dtb
+			expected_profile=helm-orin-nx-8gb-r39.2
+			;;
+		0003)
+			boot_label=helm-orin-nano-8gb
+			boot_dtb=helm-p3767-0003.dtb
+			expected_profile=helm-orin-nano-8gb-r39.2
+			;;
+		0004)
+			boot_label=helm-orin-nano-4gb
+			boot_dtb=helm-p3767-0004.dtb
+			expected_profile=helm-orin-nano-4gb-r39.2
+			;;
+		0005)
+			boot_label=helm-orin-nano-8gb-sd
+			boot_dtb=helm-p3767-0005.dtb
+			expected_profile=helm-orin-nano-8gb-sd-r39.2
+			;;
+		*) return 1 ;;
+	esac
+}
+
+load_boot_profile()
+{
+	[ -s "$metadata" ] || die "bundle profile metadata is missing: $metadata"
+	bundle_profile=$(metadata_value PROFILE_ID) || \
+		die "bundle profile metadata must contain exactly one PROFILE_ID"
+	board_id=$(metadata_value BOARD_ID) || \
+		die "bundle profile metadata must contain exactly one BOARD_ID"
+	staged_sku=$(metadata_value BOARD_SKU) || \
+		die "bundle profile metadata must contain exactly one BOARD_SKU"
+	[ -n "$bundle_profile" ] || die "bundle PROFILE_ID is empty"
+	[ "$board_id" = 3767 ] || die "unsupported bundle BOARD_ID: $board_id"
+	select_boot_profile "$staged_sku" || \
+		die "unsupported bundle BOARD_SKU: $staged_sku"
+	[ "$bundle_profile" = "$expected_profile" ] || \
+		die "bundle PROFILE_ID $bundle_profile does not match BOARD_SKU $board_sku"
+}
+
+module_matches_sku()
+{
+	case "$1" in
+		*"3767-$2"*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+validate_module()
+{
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+		for eeprom in /sys/bus/i2c/devices/*-0050/eeprom; do
+			[ -r "$eeprom" ] || continue
+			part_number=$(dd if="$eeprom" bs=1 skip=20 count=30 2>/dev/null | \
+				tr -cd ' -~')
+			if module_matches_sku "$part_number" "$board_sku"; then
+				module_part_number=$part_number
+				return 0
+			fi
+		done
+		attempt=$((attempt + 1))
+		sleep 0.1
+	done
+	die "module EEPROM does not identify the bundle's required P3767-$board_sku SKU"
+}
+
+extlinux_entry_uses_premerged_dtb()
+{
+	config=$1
+	selected_label=$2
+	selected_dtb_path=$3
+	awk -v selected_label="$selected_label" \
+		-v selected_dtb_path="$selected_dtb_path" '
+		$1 == "LABEL" {
+			selected = ($2 == selected_label)
+			if (selected)
+				label_count++
+			next
+		}
+		selected && $1 == "FDT" {
+			fdt_count++
+			if ($2 == selected_dtb_path)
+				matching_fdt_count++
+		}
+		selected && ($1 == "OVERLAYS" || $1 == "FDTOVERLAYS") {
+			overlay_count++
+		}
+		END {
+			exit !(label_count == 1 && fdt_count == 1 &&
+				matching_fdt_count == 1 && overlay_count == 0)
+		}
+	' "$config"
+}
+
+extlinux_default_is()
+{
+	config=$1
+	selected_label=$2
+	awk -v selected_label="$selected_label" '
+		$1 == "DEFAULT" {
+			default_count++
+			if ($2 == selected_label)
+				matching_default_count++
+		}
+		END {
+			exit !(default_count == 1 && matching_default_count == 1)
+		}
+	' "$config"
+}
+
+configure_installed_boot()
+{
+	config=$1
+	installed_root=$2
+	dtb_path=/boot/dtb/$boot_dtb
+	temporary_config=$config.helm-install-new
+
+	[ -s "$installed_root$dtb_path" ] || {
+		printf '%s: selected DTB is missing: %s\n' \
+			"$program" "$installed_root$dtb_path" >&2
+		return 1
+	}
+	extlinux_entry_uses_premerged_dtb \
+		"$config" "$boot_label" "$dtb_path" || {
+		printf '%s: extlinux entry %s does not use only %s\n' \
+			"$program" "$boot_label" "$dtb_path" >&2
+		return 1
+	}
+	if ! awk -v selected_label="$boot_label" '
+		$1 == "DEFAULT" {
+			default_count++
+			print "DEFAULT " selected_label
+			next
+		}
+		{ print }
+		END { if (default_count != 1) exit 1 }
+	' "$config" > "$temporary_config"
+	then
+		rm -f "$temporary_config"
+		printf '%s: extlinux.conf must contain exactly one DEFAULT directive\n' \
+			"$program" >&2
+		return 1
+	fi
+	chmod 0644 "$temporary_config"
+	mv "$temporary_config" "$config"
+	extlinux_default_is "$config" "$boot_label" || {
+		printf '%s: failed to select extlinux entry %s\n' \
+			"$program" "$boot_label" >&2
+		return 1
+	}
+}
+
+self_test()
+{
+	for mapping in \
+		'0000:helm-orin-nx-16gb:helm-p3767-0000.dtb:helm-orin-nx-16gb-r39.2' \
+		'0001:helm-orin-nx-8gb:helm-p3767-0001.dtb:helm-orin-nx-8gb-r39.2' \
+		'0003:helm-orin-nano-8gb:helm-p3767-0003.dtb:helm-orin-nano-8gb-r39.2' \
+		'0004:helm-orin-nano-4gb:helm-p3767-0004.dtb:helm-orin-nano-4gb-r39.2' \
+		'0005:helm-orin-nano-8gb-sd:helm-p3767-0005.dtb:helm-orin-nano-8gb-sd-r39.2'
+	do
+		sku=${mapping%%:*}
+		remainder=${mapping#*:}
+		expected_label=${remainder%%:*}
+		remainder=${remainder#*:}
+		expected_dtb_name=${remainder%%:*}
+		expected_profile_id=${remainder#*:}
+		select_boot_profile "$sku"
+		[ "$boot_label" = "$expected_label" ]
+		[ "$boot_dtb" = "$expected_dtb_name" ]
+		[ "$expected_profile" = "$expected_profile_id" ]
+	done
+	! select_boot_profile 0002
+	module_matches_sku '699-13767-0001-300' 0001
+	module_matches_sku '699-13767-0005-500' 0005
+	! module_matches_sku '699-13767-0005-500' 0003
+
+	test_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-install.XXXXXX")
+	trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
+	mkdir -p "$test_dir/root/boot/dtb" "$test_dir/root/boot/extlinux"
+	metadata=$test_dir/helm-profile
+	printf '%s\n' \
+		'PROFILE_ID=helm-orin-nx-8gb-r39.2' \
+		'BOARD_ID=3767' \
+		'BOARD_SKU=0001' > "$metadata"
+	[ "$(metadata_value BOARD_SKU)" = 0001 ]
+	load_boot_profile
+	[ "$boot_label" = helm-orin-nx-8gb ]
+	printf 'BOARD_SKU=0001\n' >> "$metadata"
+	if metadata_value BOARD_SKU >/dev/null 2>&1; then
+		return 1
+	fi
+
+	select_boot_profile 0001
+	printf 'test-dtb\n' > "$test_dir/root/boot/dtb/$boot_dtb"
+	printf '%s\n' \
+		'TIMEOUT 30' \
+		'DEFAULT helm-profile-required' \
+		'LABEL helm-orin-nx-8gb' \
+		'      FDT /boot/dtb/helm-p3767-0001.dtb' \
+		> "$test_dir/root/boot/extlinux/extlinux.conf"
+	configure_installed_boot \
+		"$test_dir/root/boot/extlinux/extlinux.conf" "$test_dir/root"
+	extlinux_default_is \
+		"$test_dir/root/boot/extlinux/extlinux.conf" helm-orin-nx-8gb
+	printf '%s\n' \
+		'DEFAULT helm-profile-required' \
+		'DEFAULT helm-orin-nx-8gb' \
+		'LABEL helm-orin-nx-8gb' \
+		'      FDT /boot/dtb/helm-p3767-0001.dtb' \
+		> "$test_dir/root/boot/extlinux/duplicate-default.conf"
+	if configure_installed_boot \
+		"$test_dir/root/boot/extlinux/duplicate-default.conf" \
+		"$test_dir/root" 2>/dev/null
+	then
+		return 1
+	fi
+	printf '%s\n' \
+		'LABEL helm-orin-nx-8gb' \
+		'      FDT /boot/dtb/helm-p3767-0001.dtb' \
+		'      OVERLAYS /boot/dtb/helm-p3768.dtbo' \
+		> "$test_dir/root/boot/extlinux/overlay.conf"
+	if extlinux_entry_uses_premerged_dtb \
+		"$test_dir/root/boot/extlinux/overlay.conf" \
+		helm-orin-nx-8gb /boot/dtb/helm-p3767-0001.dtb
+	then
+		return 1
+	fi
+	rm -rf "$test_dir"
+	trap - EXIT HUP INT TERM
+	printf '%s: SKU boot-selection guards passed\n' "$program"
 }
 
 canonical_nvme()
@@ -123,12 +400,22 @@ done
 case "$command_name" in
 	inspect)
 		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
+		load_boot_profile
+		validate_module
+		printf 'bundle: %s (P3767-%s)\n' "$bundle_profile" "$board_sku"
+		printf 'module: %s\n' "$module_part_number"
 		if [ -n "$device" ]; then
 			device=$(canonical_nvme "$device")
 			device_summary "$device"
 		else
 			inspect_all
 		fi
+		exit 0
+		;;
+	self-test)
+		[ -z "$device$confirm" ] || die "self-test takes no arguments"
+		[ "$archive" = "$default_archive" ] || die "self-test takes no arguments"
+		self_test
 		exit 0
 		;;
 	install) ;;
@@ -145,8 +432,11 @@ device=$(canonical_nvme "$device")
 [ "$confirm" = "$device" ] || \
 	die "--confirm must exactly equal $device"
 [ -s "$archive" ] || die "rootfs archive is missing or empty: $archive"
+load_boot_profile
+validate_module
 command -v sfdisk >/dev/null 2>&1 || die "sfdisk is unavailable"
 command -v mkfs.ext4 >/dev/null 2>&1 || die "mkfs.ext4 is unavailable"
+command -v mkfs.fat >/dev/null 2>&1 || die "mkfs.fat is unavailable"
 command -v zstd >/dev/null 2>&1 || die "zstd is unavailable"
 
 sectors=$(cat "/sys/class/block/${device##*/}/size")
@@ -159,42 +449,79 @@ printf '%s\n' "$archive_listing" | grep -qx './sbin/init' || \
 	die "archive has no /sbin/init"
 printf '%s\n' "$archive_listing" | grep -qx './boot/Image' || \
 	die "archive has no /boot/Image"
+printf '%s\n' "$archive_listing" | grep -qx './boot/extlinux/extlinux.conf' || \
+	die "archive has no /boot/extlinux/extlinux.conf"
+printf '%s\n' "$archive_listing" | grep -qx "./boot/dtb/$boot_dtb" || \
+	die "archive has no selected P3767-$board_sku DTB: $boot_dtb"
+printf '%s\n' "$archive_listing" | grep -qx './usr/lib/helm/BOOTAA64.EFI' || \
+	die "archive has no NVIDIA UEFI OS launcher"
 
 device_summary "$device"
 printf '\nDESTROYING %s and installing Helm Alpine.\n' "$device"
 trap cleanup EXIT HUP INT TERM
 
-# One GPT Linux partition is intentional: NVIDIA UEFI reads extlinux.conf and
-# the kernel directly from ext4, so an EFI System Partition is unnecessary.
-printf 'label: gpt\n, , L\n' | \
+# Keep APP as GPT entry 1 so NVIDIA's launcher resolves it as nvme0n1p1. The
+# physically earlier entry 2 is a standards-compliant 64 MiB FAT ESP.
+printf 'label: gpt\nunit: sectors\n\nstart=133120, type=L, name=APP\nstart=2048, size=131072, type=U, name=esp\n' | \
 	sfdisk --wipe always --wipe-partitions always "$device"
 partprobe "$device" || :
 udevadm settle --timeout=10 || :
 
-partition=${device}p1
+root_partition=${device}p1
+esp_partition=${device}p2
 attempt=0
-while [ ! -b "$partition" ] && [ "$attempt" -lt 50 ]; do
+while { [ ! -b "$root_partition" ] || [ ! -b "$esp_partition" ]; } && \
+	[ "$attempt" -lt 50 ]
+do
 	attempt=$((attempt + 1))
 	sleep 0.1
 done
-[ -b "$partition" ] || die "partition did not appear: $partition"
+[ -b "$root_partition" ] || die "partition did not appear: $root_partition"
+[ -b "$esp_partition" ] || die "partition did not appear: $esp_partition"
 
 mkfs.ext4 -F -L HELM_ROOT \
-	-E lazy_itable_init=0,lazy_journal_init=0 "$partition"
-mkdir -p "$mount_dir"
-mount -t ext4 -o rw,noatime "$partition" "$mount_dir"
-mounted=1
+	-E lazy_itable_init=0,lazy_journal_init=0 "$root_partition"
+mkfs.fat -F 32 -n HELM_ESP "$esp_partition"
+mkdir -p "$root_mount_dir" "$esp_mount_dir"
+mount -t ext4 -o rw,noatime "$root_partition" "$root_mount_dir"
+root_mounted=1
 
-printf 'Extracting Helm Alpine to %s...\n' "$partition"
-zstd -q -d -c "$archive" | tar -xpf - -C "$mount_dir"
-[ -e "$mount_dir/sbin/init" ] || die "installed /sbin/init is missing"
-[ -s "$mount_dir/boot/Image" ] || die "installed kernel is missing"
-[ -s "$mount_dir/boot/extlinux/extlinux.conf" ] || \
+printf 'Extracting Helm Alpine to %s...\n' "$root_partition"
+zstd -q -d -c "$archive" | tar -xpf - -C "$root_mount_dir"
+[ -e "$root_mount_dir/sbin/init" ] || die "installed /sbin/init is missing"
+[ -s "$root_mount_dir/boot/Image" ] || die "installed kernel is missing"
+[ -s "$root_mount_dir/boot/extlinux/extlinux.conf" ] || \
 	die "installed extlinux.conf is missing"
+[ -s "$root_mount_dir/boot/dtb/$boot_dtb" ] || \
+	die "installed P3767-$board_sku DTB is missing: $boot_dtb"
+[ -s "$root_mount_dir/usr/lib/helm/BOOTAA64.EFI" ] || \
+	die "installed NVIDIA UEFI OS launcher is missing"
+printf 'Selecting %s for bundle %s (P3767-%s).\n' \
+	"$boot_label" "$bundle_profile" "$board_sku"
+configure_installed_boot \
+	"$root_mount_dir/boot/extlinux/extlinux.conf" "$root_mount_dir" || \
+	die "could not configure the installed SKU-specific boot entry"
+
+mount -t vfat "$esp_partition" "$esp_mount_dir"
+esp_mounted=1
+mkdir -p "$esp_mount_dir/EFI/BOOT"
+cp "$root_mount_dir/usr/lib/helm/BOOTAA64.EFI" \
+	"$esp_mount_dir/EFI/BOOT/BOOTAA64.EFI"
+cmp -s "$root_mount_dir/usr/lib/helm/BOOTAA64.EFI" \
+	"$esp_mount_dir/EFI/BOOT/BOOTAA64.EFI" || \
+	die "EFI launcher verification failed"
+
+if command -v helm-boot-success >/dev/null 2>&1; then
+	helm-boot-success reset || \
+		printf 'Warning: firmware rootfs status could not be reset automatically.\n' >&2
+fi
 
 sync
-umount "$mount_dir"
-mounted=0
+umount "$esp_mount_dir"
+esp_mounted=0
+umount "$root_mount_dir"
+root_mounted=0
 trap - EXIT HUP INT TERM
-printf 'Helm Alpine installation complete on %s.\n' "$partition"
+printf 'Helm Alpine installation complete on %s with ESP %s.\n' \
+	"$root_partition" "$esp_partition"
 printf 'Power off before removing the recovery cable or NVMe.\n'

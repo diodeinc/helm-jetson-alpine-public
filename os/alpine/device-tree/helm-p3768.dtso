@@ -66,6 +66,8 @@
 		target-path = "/bus@0/padctl@3520000/ports/usb2-0";
 		__overlay__ {
 			mode = "peripheral";
+			usb-role-switch;
+			role-switch-default-mode = "peripheral";
 			status = "okay";
 		};
 	};

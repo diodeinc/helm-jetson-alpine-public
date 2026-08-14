@@ -36,6 +36,11 @@ Rosetta, or NVIDIA Linux host executable.
   trees, initramfs, Android boot image, and T234 recovery blob.
 - The recovery image RAM-boots on the Jetson and carries a guarded target-side
   NVMe installer, a guarded QSPI installer, and their verified payloads.
+- The install archive retains NVIDIA's pinned T23x UEFI OS launcher; recovery
+  writes it to the NVMe FAT ESP fallback path and installs the Helm extlinux
+  menu, kernel, initramfs, and DTBs on the `APP` root partition. The installer
+  validates the family bundle's P3767 `BOARD_SKU` and selects its matching
+  premerged Helm DTB as the installed default.
 - The separate `t234-bootkit` native libusb loader sends the six-file RCM
   bundle from macOS. The host-side `boot` operation is volatile and does not
   write QSPI or NVMe.
@@ -47,11 +52,16 @@ Rosetta, or NVIDIA Linux host executable.
 
 All five per-SKU catalogs, QSPI images, and recovery bundles are structurally
 verified on macOS. P3767-0001 additionally reproduces the qualified recovery
-MB1 BCT, memory BCT, and DCE component byte-for-byte. Hardware RAM-boot, QSPI
-write, and cold-boot qualification are still pending, so treat this as
-bring-up software and do not use it on irreplaceable hardware. Firmware and
-DRAM BCTs are selected by exact NVIDIA module spec; they are never borrowed
-from a nearby SKU.
+MB1 BCT, memory BCT, and DCE component byte-for-byte. That SKU has completed a
+physical RAM boot, full QSPI write/readback, NVMe installation, and cold boot
+on Helm. A second P3767-0001 also completed the complete guarded `provision`
+command from macOS with only power and recovery USB connected: recovery CDC,
+module/geometry preflight, NVMe installation, QSPI backup, write, full
+readback, and the session-bound success marker all passed without UART. The
+other four SKUs remain structurally verified but not physically qualified.
+Treat this as bring-up software and do not use it on irreplaceable hardware.
+Firmware and DRAM BCTs are selected by exact NVIDIA module spec; they are
+never borrowed from a nearby SKU.
 
 ## Native macOS build
 
@@ -77,9 +87,9 @@ Place the BSP at `build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2`, then:
 ```
 
 The BSP is consumed as a data archive. Its Linux host programs are never
-executed. The family builder automatically downloads and hash-checks NVIDIA's
-official R39.2 bootloader package; its multi-spec capsule remains opaque target
-firmware and is not executed on the Mac.
+executed. The builder automatically downloads and hash-checks NVIDIA's official
+R39.2 bootloader package; it extracts the T23x UEFI launcher and multi-spec
+capsule as data, and neither is executed on the Mac.
 
 Point the family builder at the qualified 0001 seed, then build one selected
 profile or the complete five-profile matrix:
@@ -101,7 +111,35 @@ and the bundle contract.
 
 ## RAM boot and target-side install
 
-With one selected P3767 recovery device connected directly to the Mac:
+For the customer path, connect one supported Helm directly to the Mac through
+its recovery USB port, put it in force recovery, and run one guarded command:
+
+```sh
+profile=helm-orin-nx-8gb-r39.2
+./tools/helm-macos/helm-macos --profile "$profile" provision \
+  --device /dev/nvme0n1 \
+  --confirm-device /dev/nvme0n1 \
+  --confirm-profile "$profile"
+```
+
+`provision` verifies the exact local profile bundle, records all existing
+`/dev/cu.usbmodem*` devices, volatile-boots recovery, then resolves every new
+serial node through IOKit. It accepts only a USB parent with VID:PID
+`0955:7020`, product `Helm Alpine Recovery Console`, and serial
+`helm-recovery`, so an MCP2221 UART connected after boot is also rejected. It
+then streams the complete target log. The target performs read-only NVMe,
+module EEPROM, QSPI-geometry, and payload preflight before it formats the
+confirmed NVMe. It
+then mounts partition 1, saves the complete pre-write QSPI backup there, writes
+QSPI, verifies a full readback, syncs, unmounts, and emits a session-bound
+success marker. A timeout, disconnect, target error, or mismatched marker is a
+failure, never an inferred success.
+
+The three values are intentionally repetitive: the whole-disk path must match
+its confirmation and the profile confirmation must match the selected bundle.
+At the end, leave power connected unless the command prints verified success.
+
+For manual recovery or diagnosis, the underlying non-writing steps remain:
 
 ```sh
 profile=helm-orin-nx-8gb-r39.2
@@ -110,8 +148,11 @@ profile=helm-orin-nx-8gb-r39.2
 ./tools/helm-macos/helm-macos --profile "$profile" boot
 ```
 
-`boot` transfers the recovery environment into RAM. On the Helm debug UART,
-first inspect the device and then explicitly install:
+`boot` transfers the recovery environment into RAM and then the same recovery
+USB port re-enumerates as a CDC serial console plus NCM network interface. Open
+the new `/dev/cu.usbmodem*` at 115200 baud (the onboard debug UART remains an
+optional bring-up fallback), then inspect the device and explicitly install.
+Plain `boot` never invokes an installer and never writes NVMe or QSPI:
 
 ```sh
 helm-install inspect
@@ -120,8 +161,10 @@ helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1
 
 The second command destroys that NVMe. It refuses non-NVMe paths, mounted
 targets, devices below 2 GiB, and confirmation text that does not exactly
-match the selected whole disk. It creates a GPT/ext4 `HELM_ROOT` filesystem
-and extracts the verified OS archive. It does not touch QSPI.
+match the selected whole disk. It creates GPT entry 1 as the ext4 `APP` /
+`HELM_ROOT` filesystem and GPT entry 2 as a 64 MiB FAT `esp` / `HELM_ESP`,
+extracts the verified OS archive, and installs the UEFI fallback launcher. It
+does not touch QSPI.
 
 Only after the NVMe install succeeds, mount it for the mandatory QSPI backup:
 
@@ -138,9 +181,9 @@ The last command erases and rewrites all 64 MiB of QSPI. It refuses a module
 EEPROM that does not match the bundled P3767 SKU, the wrong device geometry, a
 non-block-backed backup path, insufficient backup space, an existing backup
 file, a bad image checksum, or incorrect confirmation. It backs up QSPI before
-erasing and compares a full-device readback afterward. This destructive path
-is implemented and structurally verified, but not yet qualified on a physical
-Helm.
+erasing and compares a full-device readback afterward. The combined
+`provision` path has passed this destructive backup/write/readback sequence on
+a physical P3767-0001 Helm without UART.
 
 ## Repository layout
 
@@ -151,7 +194,9 @@ Helm.
   image-format builders
 
 See [`os/alpine/README.md`](os/alpine/README.md) for image contents and first
-boot behavior.
+boot behavior. See the
+[`P3767-0001 bring-up record`](docs/p3767-0001-bringup.md) for measured USB,
+Ethernet, PCIe/NVMe, fan, and LED results from the physical Helm board.
 
 ## Security
 

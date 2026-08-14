@@ -5,6 +5,7 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 
 l4t_archive=${HELM_L4T_ARCHIVE:-"$repo_dir/build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2"}
+bootloader_deb=${HELM_R39_BOOTLOADER_DEB:-"$repo_dir/build/downloads/nvidia-l4t-bootloader_39.2.0-20260601141651_arm64.deb"}
 build_dir=${HELM_ALPINE_BUILD_DIR:-"$repo_dir/build/helm-alpine-native"}
 work_dir=$build_dir/work
 output_dir=$build_dir/out
@@ -12,9 +13,12 @@ rootfs_dir=$work_dir/rootfs
 l4t_dir=$work_dir/l4t
 oot_dir=$work_dir/oot-modules
 deb_dir=$work_dir/firmware-deb
+launcher_dir=$work_dir/bootloader-deb
 initramfs_dir=$work_dir/initramfs
 recovery_dir=$work_dir/recovery-initramfs
 kernel_release=6.8.12-1021-tegra
+bootloader_deb_sha256=01ef88369674ab5b9dd0dca6378e19012b594b4b3b95f2378b2d191ee0c331be
+launcher_sha256=c9b54649f7a05fc326d1bf82fc68fa234d6e5a915cb56f8030874fdb21514d32
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
 	echo "The native builder requires Apple-silicon macOS." >&2
@@ -44,13 +48,26 @@ if [ ! -f "$l4t_archive" ]; then
 	exit 66
 fi
 
+if [ ! -f "$bootloader_deb" ]; then
+	echo "Missing NVIDIA Jetson Linux R39.2 bootloader package:" >&2
+	echo "  $bootloader_deb" >&2
+	exit 66
+fi
+actual_bootloader_deb_sha256=$(shasum -a 256 "$bootloader_deb" | awk '{print $1}')
+if [ "$actual_bootloader_deb_sha256" != "$bootloader_deb_sha256" ]; then
+	echo "NVIDIA bootloader package SHA-256 mismatch:" >&2
+	echo "  expected: $bootloader_deb_sha256" >&2
+	echo "  actual:   $actual_bootloader_deb_sha256" >&2
+	exit 65
+fi
+
 export COPYFILE_DISABLE=1
 
 clean_directory()
 {
 	directory=$1
 	case "$directory" in
-		"$rootfs_dir"|"$l4t_dir"|"$oot_dir"|"$deb_dir"|\
+		"$rootfs_dir"|"$l4t_dir"|"$oot_dir"|"$deb_dir"|"$launcher_dir"|\
 		"$initramfs_dir"|"$recovery_dir"|"$output_dir") ;;
 		*) echo "refusing to clean unexpected directory: $directory" >&2; exit 70 ;;
 	esac
@@ -76,6 +93,30 @@ apko build-minirootfs \
 	--no-same-owner \
 	--exclude 'dev/*'
 mkdir -p "$rootfs_dir/dev/pts" "$rootfs_dir/dev/shm"
+
+# apko 1.2.x renders its InstallIf []string with Go's bracket notation in
+# the legacy installed database (for example, "i:[openrc chrony=4.8-r7]").
+# apk-tools 3 treats the brackets as unsupported dependency syntax and can
+# reject the entire database. Normalize only that field back to apk's v2
+# database syntax; leave all package and file records otherwise untouched.
+apk_installed_db=$rootfs_dir/usr/lib/apk/db/installed
+apk_installed_db_tmp=$apk_installed_db.helm-new
+awk '
+	$0 == "i:[]" { next }
+	/^i:\[/ {
+		if (substr($0, length($0), 1) != "]") exit 1
+		print "i:" substr($0, 4, length($0) - 4)
+		next
+	}
+	{ print }
+' "$apk_installed_db" > "$apk_installed_db_tmp"
+chmod 0644 "$apk_installed_db_tmp"
+mv "$apk_installed_db_tmp" "$apk_installed_db"
+if grep -q '^i:\[' "$apk_installed_db"; then
+	echo "apko installed database still contains bracketed install_if data" >&2
+	exit 70
+fi
+
 # Unprivileged libarchive extraction deliberately clears setuid. Restore the
 # one Alpine helper that is shipped setuid and make it readable to the builder.
 chmod 4511 "$rootfs_dir/bin/bbsuid"
@@ -110,6 +151,21 @@ firmware_data=$(find "$deb_dir" -maxdepth 1 -type f -name 'data.tar*' -print | h
 [ -n "$firmware_data" ] || { echo "firmware data archive is missing" >&2; exit 70; }
 "$archive_tool" -xf "$firmware_data" -C "$rootfs_dir"
 
+echo "==> Extracting NVIDIA's pinned T23x UEFI OS launcher as data"
+clean_directory "$launcher_dir"
+"$archive_tool" -xf "$bootloader_deb" -C "$launcher_dir" data.tar.zst
+launcher_data=$launcher_dir/data.tar.zst
+[ -s "$launcher_data" ] || { echo "bootloader package data archive is missing" >&2; exit 70; }
+"$archive_tool" -xf "$launcher_data" -C "$launcher_dir" \
+	./opt/ota_package/t23x/BOOTAA64.efi
+launcher=$launcher_dir/opt/ota_package/t23x/BOOTAA64.efi
+[ -s "$launcher" ] || { echo "T23x UEFI OS launcher is missing" >&2; exit 70; }
+actual_launcher_sha256=$(shasum -a 256 "$launcher" | awk '{print $1}')
+[ "$actual_launcher_sha256" = "$launcher_sha256" ] || {
+	echo "T23x UEFI OS launcher SHA-256 mismatch: $actual_launcher_sha256" >&2
+	exit 65
+}
+
 if [ -d "$rootfs_dir/lib/systemd" ]; then
 	find "$rootfs_dir/lib/systemd" -mindepth 1 -delete
 	rmdir "$rootfs_dir/lib/systemd"
@@ -117,18 +173,25 @@ fi
 
 echo "==> Applying the Helm filesystem overlay"
 cp -a "$script_dir/rootfs-overlay/." "$rootfs_dir/"
-mkdir -p "$rootfs_dir/boot/extlinux" "$rootfs_dir/etc/mkinitfs"
+mkdir -p \
+	"$rootfs_dir/boot/extlinux" \
+	"$rootfs_dir/etc/mkinitfs" \
+	"$rootfs_dir/usr/lib/helm"
 install -m 0644 "$script_dir/mkinitfs.conf" "$rootfs_dir/etc/mkinitfs/mkinitfs.conf"
 install -m 0644 "$script_dir/extlinux.conf" "$rootfs_dir/boot/extlinux/extlinux.conf"
 install -m 0644 "$l4t_root/kernel/Image" "$rootfs_dir/boot/Image"
+install -m 0644 "$launcher" "$rootfs_dir/usr/lib/helm/BOOTAA64.EFI"
 
 chmod 0755 \
+	"$rootfs_dir/etc/init.d/helm-boot-success" \
 	"$rootfs_dir/etc/init.d/helm-peripherals" \
+	"$rootfs_dir/usr/sbin/helm-boot-success" \
 	"$rootfs_dir/usr/sbin/helm-console-login" \
 	"$rootfs_dir/usr/sbin/helm-info" \
 	"$rootfs_dir/usr/sbin/helm-install" \
 	"$rootfs_dir/usr/sbin/helm-led" \
 	"$rootfs_dir/usr/sbin/helm-peripherals" \
+	"$rootfs_dir/usr/sbin/helm-provision" \
 	"$rootfs_dir/usr/sbin/helm-qspi-install"
 chmod 0600 "$rootfs_dir/etc/dropbear/dropbear.conf"
 
@@ -167,7 +230,7 @@ done
 for service in modules hwdrivers sysctl hostname bootmisc fsck root localmount seedrng swclock; do
 	enable_service "$service" boot
 done
-for service in udev-postmount syslog dhcpcd chronyd dropbear helm-peripherals local; do
+for service in udev-postmount syslog dhcpcd chronyd helm-peripherals helm-boot-success dropbear local; do
 	enable_service "$service" default
 done
 for service in mount-ro killprocs savecache; do
@@ -189,7 +252,7 @@ for sku in 0000 0001 0003 0004 0005; do
 	fdtput -r "$helm_dtb" "/bus@0/i2c@c240000/fusb301@25" || :
 	fdtput -r "$helm_dtb" "/gpio-keys/key-power" || :
 	fdtput -r "$helm_dtb" "/bus@0/padctl@3520000/ports/usb2-0/port" || :
-	fdtput -d "$helm_dtb" "/bus@0/padctl@3520000/ports/usb2-0" usb-role-switch || :
+	fdtput -d "$helm_dtb" "/__symbols__" typec_p0 || :
 	fdtput -d "$helm_dtb" "/regulator-vdd-3v3-pcie" gpio || :
 	fdtput -d "$helm_dtb" "/regulator-vdd-3v3-pcie" enable-active-high || :
 	fdtput -t s "$helm_dtb" "/regulator-vdd-3v3-pcie" status disabled
@@ -245,19 +308,56 @@ EOF
 alpine_version=$(cat "$rootfs_dir/etc/alpine-release")
 artifact_prefix=helm-alpine-$alpine_version-l4t-r39.2
 rootfs_archive=$output_dir/$artifact_prefix-rootfs.tar.zst
+rootfs_tar=$output_dir/$artifact_prefix-rootfs.tar
+
+chrony_uid=$(awk -F: '$1 == "chrony" { print $3 }' "$rootfs_dir/etc/passwd")
+chrony_gid=$(awk -F: '$1 == "chrony" { print $3 }' "$rootfs_dir/etc/group")
+if [ "$chrony_uid:$chrony_gid" != 100:101 ]; then
+	echo "unexpected chrony account IDs: $chrony_uid:$chrony_gid" >&2
+	exit 70
+fi
+dhcpcd_uid=$(awk -F: '$1 == "dhcpcd" { print $3 }' "$rootfs_dir/etc/passwd")
+dhcpcd_gid=$(awk -F: '$1 == "dhcpcd" { print $3 }' "$rootfs_dir/etc/group")
+if [ "$dhcpcd_uid:$dhcpcd_gid" != 101:102 ]; then
+	echo "unexpected dhcpcd account IDs: $dhcpcd_uid:$dhcpcd_gid" >&2
+	exit 70
+fi
 
 echo "==> Packaging the installable rootfs on macOS"
 (
 	cd "$rootfs_dir"
+	# macOS cannot materialize numeric owners from apko while extracting, so
+	# omit service-owned state directories from the all-root archive and append
+	# their headers with the declarative UIDs/GIDs.
 	find . -print | LC_ALL=C sort | \
+		awk '$0 != "./var/lib/chrony" && $0 != "./var/lib/dhcpcd"' | \
 		"$archive_tool" \
 			--format pax \
 			--no-recursion \
 			--uid 0 --gid 0 --uname root --gname root \
 			--numeric-owner --no-xattrs --no-acls --no-fflags \
-			-cf - -T - | \
-		zstd -q -T0 -10 -o "$rootfs_archive"
+			-cf "$rootfs_tar" -T -
+	printf '%s\n' ./var/lib/chrony | \
+		"$archive_tool" \
+			--format pax \
+			--no-recursion \
+			--uid "$chrony_uid" --gid "$chrony_gid" \
+			--numeric-owner --no-xattrs --no-acls --no-fflags \
+			-rf "$rootfs_tar" -T -
+	printf '%s\n' ./var/lib/dhcpcd | \
+		"$archive_tool" \
+			--format pax \
+			--no-recursion \
+			--uid "$dhcpcd_uid" --gid "$dhcpcd_gid" \
+			--numeric-owner --no-xattrs --no-acls --no-fflags \
+			-rf "$rootfs_tar" -T -
 )
+"$archive_tool" --numeric-owner -tvf "$rootfs_tar" | \
+	awk '$NF == "./var/lib/chrony/" && $3 == 100 && $4 == 101 { found = 1 } END { exit !found }'
+"$archive_tool" --numeric-owner -tvf "$rootfs_tar" | \
+	awk '$NF == "./var/lib/dhcpcd/" && $3 == 101 && $4 == 102 { found = 1 } END { exit !found }'
+zstd -q -T0 -10 "$rootfs_tar" -o "$rootfs_archive"
+rm "$rootfs_tar"
 
 echo "==> Creating a self-contained NVMe recovery initramfs"
 clean_directory "$recovery_dir"
@@ -283,7 +383,11 @@ install -m 0755 "$script_dir/initramfs/recovery-init" "$recovery_dir/init"
 install -m 0644 "$rootfs_archive" \
 	"$recovery_dir/opt/helm/payload/helm-rootfs.tar.zst"
 
-for module in at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+for module in \
+	pwm-tegra pwm-fan \
+	at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme \
+	tegra-xudc libcomposite u_serial usb_f_acm u_ether usb_f_ncm
+do
 	module_path=$(find "$module_source" -type f -name "$module.ko" -print | head -n 1)
 	if [ -n "$module_path" ]; then
 		relative_path=${module_path#"$module_source"/}
@@ -304,7 +408,7 @@ recovery_boot=$output_dir/$artifact_prefix-recovery-boot.img
 python3 "$repo_dir/tools/helm-macos/mkbootimg.py" \
 	--kernel "$rootfs_dir/boot/Image" \
 	--ramdisk "$recovery_initramfs" \
-	--cmdline "rdinit=/init rw console=ttyTCU0,115200 console=tty0 firmware_class.path=/lib/firmware pci=pcie_bus_perf nvme.use_threaded_interrupts=1" \
+	--cmdline "rdinit=/init rw console=tty0 console=ttyTCU0,115200 firmware_class.path=/lib/firmware pci=pcie_bus_perf nvme.use_threaded_interrupts=1" \
 	--output "$recovery_boot"
 
 echo "==> Packaging the boot archive on macOS"
@@ -340,13 +444,39 @@ test -L "$rootfs_dir/sbin/init"
 test -x "$rootfs_dir/bin/busybox"
 test -x "$rootfs_dir/usr/sbin/dropbear"
 test -x "$rootfs_dir/usr/sbin/helm-install"
+test -x "$rootfs_dir/usr/sbin/helm-provision"
 test -x "$rootfs_dir/usr/sbin/helm-qspi-install"
+"$rootfs_dir/usr/sbin/helm-install" self-test
+"$rootfs_dir/usr/sbin/helm-provision" self-test
+grep -qx 'DEFAULT helm-profile-required' \
+	"$rootfs_dir/boot/extlinux/extlinux.conf"
+! grep -q '^LABEL helm-auto$' "$rootfs_dir/boot/extlinux/extlinux.conf"
 test -x "$rootfs_dir/usr/bin/zstd"
 test -x "$rootfs_dir/sbin/sfdisk"
 test -s "$rootfs_dir/boot/Image"
 test -s "$rootfs_dir/boot/initramfs-helm"
 test -s "$rootfs_dir/boot/dtb/helm-p3768.dtbo"
+test "$(shasum -a 256 "$rootfs_dir/usr/lib/helm/BOOTAA64.EFI" | awk '{print $1}')" = \
+	"$launcher_sha256"
+test -x "$rootfs_dir/sbin/mkfs.fat"
+test -x "$rootfs_dir/usr/bin/iperf3"
+awk -F: '$1 == "chrony" && $3 == 100 && $4 == 101 && $6 == "/dev/null" && $7 == "/sbin/nologin" { found = 1 } END { exit !found }' \
+	"$rootfs_dir/etc/passwd"
+awk -F: '$1 == "chrony" && $3 == 101 { found = 1 } END { exit !found }' \
+	"$rootfs_dir/etc/group"
+awk -F: '$1 == "dhcpcd" && $3 == 101 && $4 == 102 && $6 == "/var/lib/dhcpcd" && $7 == "/sbin/nologin" { found = 1 } END { exit !found }' \
+	"$rootfs_dir/etc/passwd"
+awk -F: '$1 == "dhcpcd" && $3 == 102 { found = 1 } END { exit !found }' \
+	"$rootfs_dir/etc/group"
+grep -Eq '^i:openrc chrony=' "$rootfs_dir/usr/lib/apk/db/installed"
+! grep -q '^i:\[' "$rootfs_dir/usr/lib/apk/db/installed"
 test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/misc/eeprom/at24.ko"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/usb/gadget/udc/tegra-xudc.ko"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/usb/gadget/function/usb_f_acm.ko"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/usb/gadget/function/usb_f_ncm.ko"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/pwm/pwm-tegra.ko"
+test -e "$recovery_dir/lib/modules/$kernel_release/kernel/drivers/hwmon/pwm-fan.ko"
+test -x "$recovery_dir/usr/sbin/helm-provision"
 test -e "$rootfs_dir/lib/modules/$kernel_release/kernel/drivers/pci/controller/dwc/pcie-tegra194.ko"
 test -e "$rootfs_dir/lib/modules/$kernel_release/updates/drivers/net/ethernet/realtek/r8168/r8168.ko"
 test -s "$recovery_initramfs"

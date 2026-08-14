@@ -1,0 +1,279 @@
+#!/bin/sh
+set -eu
+
+program=${0##*/}
+metadata=/opt/helm/payload/helm-profile
+device=
+device_seen=0
+confirm_device=
+confirm_device_seen=0
+confirm_profile=
+confirm_profile_seen=0
+session=
+session_seen=0
+bundle_profile=
+mount_dir=/mnt/helm-provision-root
+root_mounted=0
+succeeded=0
+marker_armed=0
+
+usage()
+{
+	cat <<EOF
+usage:
+  $program install --device /dev/nvme0n1 \\
+    --confirm-device /dev/nvme0n1 --confirm-profile PROFILE \\
+    --session 32_LOWERCASE_HEX_CHARACTERS
+  $program self-test
+
+This is the recovery-only NVMe + QSPI orchestrator. install destroys the
+confirmed NVMe, saves a full QSPI backup on its new root filesystem, then
+rewrites and verifies QSPI. All confirmations must exactly match the embedded
+bundle and selected whole NVMe namespace.
+EOF
+}
+
+die()
+{
+	printf '%s: %s\n' "$program" "$*" >&2
+	exit 1
+}
+
+metadata_value()
+{
+	key=$1
+	awk -F= -v key="$key" '
+		$1 == key {
+			count++
+			sub(/^[^=]*=/, "")
+			value = $0
+		}
+		END {
+			if (count != 1)
+				exit 1
+			print value
+		}
+	' "$metadata"
+}
+
+profile_supported()
+{
+	case "$1" in
+		helm-orin-nx-16gb-r39.2|helm-orin-nx-8gb-r39.2|\
+		helm-orin-nano-8gb-r39.2|helm-orin-nano-4gb-r39.2|\
+		helm-orin-nano-8gb-sd-r39.2) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+device_supported()
+{
+	case "$1" in
+		/dev/nvme[0-9]n[0-9]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+session_supported()
+{
+	[ "${#1}" -eq 32 ] || return 1
+	case "$1" in
+		*[!0-9a-f]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+persistent_backup_path_allowed()
+{
+	candidate=$1
+	case "$candidate" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "$candidate" in
+		/dev/*|/proc/*|/run/*|/sys/*|/tmp/*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+cleanup()
+{
+	if [ "$root_mounted" -eq 1 ]; then
+		sync || :
+		umount "$mount_dir" || :
+		root_mounted=0
+	fi
+}
+
+finish()
+{
+	rc=$?
+	trap - EXIT HUP INT TERM
+	cleanup
+	if [ "$marker_armed" -eq 1 ] && [ "$succeeded" -eq 0 ]; then
+		printf '\nHELM_PROVISION_FAILURE session=%s rc=%s\n' "$session" "$rc"
+	fi
+	exit "$rc"
+}
+
+self_test()
+{
+	for supported_profile in \
+		helm-orin-nx-16gb-r39.2 \
+		helm-orin-nx-8gb-r39.2 \
+		helm-orin-nano-8gb-r39.2 \
+		helm-orin-nano-4gb-r39.2 \
+		helm-orin-nano-8gb-sd-r39.2
+	do
+		profile_supported "$supported_profile"
+	done
+	! profile_supported helm-orin-nx-8gb-r39.1
+	device_supported /dev/nvme0n1
+	device_supported /dev/nvme9n8
+	! device_supported /dev/nvme0n1p1
+	! device_supported /dev/sda
+	session_supported 0123456789abcdef0123456789abcdef
+	! session_supported 0123456789ABCDEF0123456789ABCDEF
+	! session_supported 0123456789abcdef
+	persistent_backup_path_allowed \
+		/mnt/helm-provision-root/root/qspi-before.img
+	for forbidden_backup in \
+		/dev/nvme0n1p1/qspi-before.img \
+		/proc/helm/qspi-before.img \
+		/run/helm-provision/root/qspi-before.img \
+		/sys/helm/qspi-before.img \
+		/tmp/helm/qspi-before.img
+	do
+		! persistent_backup_path_allowed "$forbidden_backup"
+	done
+	! persistent_backup_path_allowed relative/qspi-before.img
+	printf '%s: confirmation guards passed\n' "$program"
+}
+
+command_name=${1:-}
+[ "$#" -gt 0 ] && shift
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--device)
+			[ "$#" -ge 2 ] || die "--device needs a value"
+			[ "$device_seen" -eq 0 ] || die "--device may be specified only once"
+			device=$2
+			device_seen=1
+			shift 2
+			;;
+		--confirm-device)
+			[ "$#" -ge 2 ] || die "--confirm-device needs a value"
+			[ "$confirm_device_seen" -eq 0 ] || \
+				die "--confirm-device may be specified only once"
+			confirm_device=$2
+			confirm_device_seen=1
+			shift 2
+			;;
+		--confirm-profile)
+			[ "$#" -ge 2 ] || die "--confirm-profile needs a value"
+			[ "$confirm_profile_seen" -eq 0 ] || \
+				die "--confirm-profile may be specified only once"
+			confirm_profile=$2
+			confirm_profile_seen=1
+			shift 2
+			;;
+		--session)
+			[ "$#" -ge 2 ] || die "--session needs a value"
+			[ "$session_seen" -eq 0 ] || die "--session may be specified only once"
+			session=$2
+			session_seen=1
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*) die "unknown argument: $1" ;;
+	esac
+done
+
+case "$command_name" in
+	self-test)
+		[ "$device_seen$confirm_device_seen$confirm_profile_seen$session_seen" = \
+			0000 ] || \
+			die "self-test takes no arguments"
+		self_test
+		exit 0
+		;;
+	install) ;;
+	-h|--help|help|"")
+		usage
+		exit 0
+		;;
+	*) die "unknown command: $command_name" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || die "install must run as root"
+[ -n "$session" ] || die "install requires --session"
+session_supported "$session" || \
+	die "--session must be exactly 32 lowercase hexadecimal characters"
+marker_armed=1
+trap finish EXIT
+# A host timeout or cable interruption must not terminate flashcp halfway
+# through QSPI. The operation continues on-target; UART remains the fallback.
+trap '' HUP
+trap 'exit 130' INT TERM
+
+[ -s "$metadata" ] || die "bundle profile metadata is missing: $metadata"
+bundle_profile=$(metadata_value PROFILE_ID) || \
+	die "bundle metadata must contain exactly one PROFILE_ID"
+profile_supported "$bundle_profile" || \
+	die "unsupported embedded bundle profile: $bundle_profile"
+[ -n "$device" ] || die "install requires --device"
+device_supported "$device" || \
+	die "refusing non-NVMe whole-disk path: $device"
+[ "$confirm_device" = "$device" ] || \
+	die "--confirm-device must exactly equal $device"
+[ "$confirm_profile" = "$bundle_profile" ] || \
+	die "--confirm-profile must exactly equal $bundle_profile"
+
+for required_command in helm-install helm-qspi-install mount umount sync
+do
+	command -v "$required_command" >/dev/null 2>&1 || \
+		die "required recovery command is unavailable: $required_command"
+done
+
+printf 'HELM_PROVISION_STAGE preflight profile=%s device=%s\n' \
+	"$bundle_profile" "$device"
+# Both inspectors validate bundle identity, module EEPROM, target type, QSPI
+# geometry, and embedded payloads before the first persistent write.
+helm-install inspect --device "$device"
+helm-qspi-install inspect --device /dev/mtd0
+
+printf 'HELM_PROVISION_STAGE nvme-install device=%s\n' "$device"
+helm-install install --device "$device" --confirm "$confirm_device"
+
+root_partition=${device}p1
+attempt=0
+while [ ! -b "$root_partition" ] && [ "$attempt" -lt 100 ]; do
+	attempt=$((attempt + 1))
+	sleep 0.1
+done
+[ -b "$root_partition" ] || die "installed root partition did not appear: $root_partition"
+
+backup=$mount_dir/root/qspi-before.img
+persistent_backup_path_allowed "$backup" || \
+	die "internal backup path is not permitted persistent storage: $backup"
+mkdir -p "$mount_dir"
+mount -t ext4 -o rw,noatime "$root_partition" "$mount_dir"
+root_mounted=1
+[ ! -e "$backup" ] && [ ! -L "$backup" ] || \
+	die "refusing to overwrite existing QSPI backup: $backup"
+
+printf 'HELM_PROVISION_STAGE qspi-install backup=%s\n' \
+	"$root_partition:/root/qspi-before.img"
+helm-qspi-install install --device /dev/mtd0 \
+	--backup "$backup" --confirm "$confirm_profile"
+
+sync
+umount "$mount_dir"
+root_mounted=0
+succeeded=1
+printf '\nHELM_PROVISION_SUCCESS session=%s profile=%s device=%s\n' \
+	"$session" "$bundle_profile" "$device"
+printf 'Provisioning is complete. Power off, release force recovery, and cold boot.\n'

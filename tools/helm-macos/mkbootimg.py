@@ -85,7 +85,7 @@ def main() -> int:
     parser.add_argument("--ramdisk", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--name", default="helm-recovery")
-    parser.add_argument("--cmdline", default="rdinit=/init console=ttyTCU0,115200 console=tty0")
+    parser.add_argument("--cmdline", default="rdinit=/init console=tty0 console=ttyTCU0,115200")
     parser.add_argument("--page-size", type=lambda value: int(value, 0), default=2048)
     parser.add_argument("--kernel-addr", type=lambda value: int(value, 0), default=0x10008000)
     parser.add_argument("--ramdisk-addr", type=lambda value: int(value, 0), default=0x11000000)

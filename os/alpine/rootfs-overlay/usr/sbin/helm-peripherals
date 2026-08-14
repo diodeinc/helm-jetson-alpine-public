@@ -11,12 +11,62 @@ set_led_trigger()
 	fi
 }
 
+start_fan()
+{
+	for fan_chip in /sys/class/pwm/pwmchip*; do
+		[ -e "$fan_chip" ] || continue
+		fan_device=$(readlink -f "$fan_chip/device" 2>/dev/null || :)
+		[ "${fan_device##*/}" = "3280000.pwm" ] || continue
+		if [ ! -d "$fan_chip/pwm0" ]; then
+			printf '0\n' > "$fan_chip/export" 2>/dev/null || :
+		fi
+		attempt=0
+		while [ ! -d "$fan_chip/pwm0" ] && [ "$attempt" -lt 20 ]; do
+			attempt=$((attempt + 1))
+			sleep 0.05
+		done
+		[ -d "$fan_chip/pwm0" ] || continue
+		printf '0\n' > "$fan_chip/pwm0/enable" 2>/dev/null || :
+		printf '45334\n' > "$fan_chip/pwm0/period" 2>/dev/null || continue
+		printf '45334\n' > "$fan_chip/pwm0/duty_cycle" 2>/dev/null || continue
+		printf '1\n' > "$fan_chip/pwm0/enable" 2>/dev/null || continue
+		printf '%s/pwm0 full\n' "$fan_chip"
+		return 0
+	done
+	printf 'unavailable\n'
+	return 1
+}
+
+keep_xusb_active()
+{
+	control=/sys/bus/platform/devices/3610000.usb/power/control
+	[ -w "$control" ] || {
+		printf 'unavailable\n'
+		return 1
+	}
+
+	# R39.2 can fail to reload the XUSB Falcon firmware after runtime
+	# autosuspend, leaving both host ports unavailable until the next boot.
+	# Helm is externally powered, so favor reliable hotplug over this small
+	# controller-only idle power saving.
+	printf 'on\n' > "$control" 2>/dev/null || {
+		printf 'unavailable\n'
+		return 1
+	}
+	cat "$control"
+}
+
 # Device-tree modaliases normally load these automatically. Explicit attempts
 # make early bring-up deterministic while remaining harmless for built-ins.
 depmod -a 2>/dev/null || :
 modprobe r8168 2>/dev/null || :
 modprobe i2c-dev 2>/dev/null || :
 modprobe pwm-tegra-tachometer 2>/dev/null || :
+
+fan_state=$(start_fan || :)
+[ -n "$fan_state" ] || fan_state=unavailable
+xusb_runtime_pm=$(keep_xusb_active || :)
+[ -n "$xusb_runtime_pm" ] || xusb_runtime_pm=unavailable
 
 set_led_trigger helm:green:status heartbeat
 set_led_trigger helm:orange:activity disk-activity
@@ -27,6 +77,8 @@ set_led_trigger helm:orange:activity disk-activity
 	echo "nvme=$(find /sys/class/nvme -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
 	echo "leds=$(find /sys/class/leds -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
 	echo "cooling_devices=$(find /sys/class/thermal -name 'cooling_device*' 2>/dev/null | wc -l | tr -d ' ')"
+	echo "fan_pwm=$fan_state"
+	echo "xusb_runtime_pm=$xusb_runtime_pm"
 } > /run/helm-peripherals
 
-logger -t helm-peripherals "Helm carrier initialization complete"
+logger -t helm-peripherals "Helm carrier initialization complete" || :

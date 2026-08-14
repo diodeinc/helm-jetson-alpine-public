@@ -53,9 +53,9 @@ jobs:
       - name: Validate workflow and source
         run: |
           actionlint
-          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh)' os tools \
+          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh|sbin/openrc-run)' os tools \
             | xargs -0 -n 1 sh -n
-          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh)' os tools \
+          rg -l -0 '^#!/(bin/(ba)?sh|usr/bin/env (ba)?sh|sbin/openrc-run)' os tools \
             | xargs -0 shellcheck --shell=sh --severity=warning
           for profile_definition in tools/helm-macos/profiles/*.conf; do
             sh -n "$profile_definition"
@@ -63,10 +63,16 @@ jobs:
           python3 -m py_compile \
             tools/helm-macos/build-r39-family-inputs.py \
             tools/helm-macos/build-rcm-blob.py \
+            tools/helm-macos/helm-provision-console.py \
             tools/helm-macos/mkbootimg.py
           tools/helm-macos/build-r39-family-inputs.py --self-test
           tools/helm-macos/build-rcm-blob.py --self-test
+          tools/helm-macos/helm-provision-console.py --self-test
+          sh os/alpine/initramfs/recovery-init self-test
           os/alpine/rootfs-overlay/usr/sbin/helm-install --help >/dev/null
+          os/alpine/rootfs-overlay/usr/sbin/helm-install self-test
+          os/alpine/rootfs-overlay/usr/sbin/helm-provision --help >/dev/null
+          os/alpine/rootfs-overlay/usr/sbin/helm-provision self-test
           os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install --help >/dev/null
           os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install self-test
           test "$(shasum tools/helm-macos/profile-data/r39.2/helm-orin-nx-8gb-r39.2/qspi_bootblob_ver.txt \
@@ -83,6 +89,15 @@ jobs:
             tools/helm-macos/helm-macos --profile "$profile" --help >/dev/null
             tools/helm-macos/helm-macos --profile "$profile" install-help \
               | grep -q -- "--confirm $profile"
+            tools/helm-macos/helm-macos --profile "$profile" provision --help \
+              | grep -q -- "--confirm-profile PROFILE"
+            if tools/helm-macos/helm-macos --profile "$profile" provision \
+              --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \
+              --confirm-profile deliberately-wrong >/dev/null 2>&1
+            then
+              echo "provision accepted the wrong profile confirmation" >&2
+              exit 1
+            fi
           done
 
       - name: Test native Android boot-image builder

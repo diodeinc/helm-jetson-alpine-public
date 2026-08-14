@@ -17,7 +17,7 @@ emergency_shell()
 	exec "$bb" sh < /dev/console > /dev/console 2>&1
 }
 
-mkdir -p /dev /dev/pts /proc /sys /run /newroot
+"$bb" mkdir -p /dev /dev/pts /proc /sys /run /newroot
 "$bb" mount -t devtmpfs devtmpfs /dev || emergency_shell "cannot mount devtmpfs"
 "$bb" mount -t devpts devpts /dev/pts || :
 "$bb" mount -t proc proc /proc || emergency_shell "cannot mount proc"
@@ -43,7 +43,7 @@ for module in phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
 done
 
 root_spec=LABEL=HELM_ROOT
-for argument in $(cat /proc/cmdline); do
+for argument in $("$bb" cat /proc/cmdline); do
 	case "$argument" in
 		root=*) root_spec=${argument#root=} ;;
 	esac
@@ -84,7 +84,7 @@ log "mounting $root_device"
 "$bb" mount -t ext4 -o rw,noatime "$root_device" /newroot || \
 	emergency_shell "cannot mount $root_device"
 
-mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
+"$bb" mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
 "$bb" mount -o move /dev /newroot/dev
 "$bb" mount -o move /proc /newroot/proc
 "$bb" mount -o move /sys /newroot/sys

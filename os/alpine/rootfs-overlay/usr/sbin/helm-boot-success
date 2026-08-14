@@ -1,0 +1,100 @@
+#!/bin/sh
+set -u
+
+program=${0##*/}
+public_guid=781e084c-a330-417c-b678-38e696380cb9
+efivar_root=/sys/firmware/efi/efivars
+retry_max=3
+
+find_pmc()
+{
+	for candidate in \
+		/sys/devices/platform/bus@0/c360000.pmc \
+		/sys/devices/platform/c360000.pmc \
+		/sys/devices/platform/bus@0/c800000.pmc \
+		/sys/devices/platform/c800000.pmc
+	do
+		[ -d "$candidate" ] || continue
+		printf '%s\n' "$candidate"
+		return 0
+	done
+	return 1
+}
+
+mount_efivarfs()
+{
+	[ -d /sys/firmware/efi ] || return 1
+	mkdir -p "$efivar_root"
+	if ! grep -q " $efivar_root efivarfs " /proc/mounts; then
+		mount -t efivarfs efivarfs "$efivar_root" 2>/dev/null || return 1
+	fi
+}
+
+reset_slot_a_status()
+{
+	mount_efivarfs || return 1
+	variable=$efivar_root/RootfsStatusSlotA-$public_guid
+	if [ -e "$variable" ] && command -v chattr >/dev/null 2>&1; then
+		chattr -i "$variable" 2>/dev/null || :
+	fi
+	# efivarfs files contain a little-endian UINT32 attributes header followed
+	# by the variable payload. 0x07 is NV|BS|RT; a zero payload means normal.
+	printf '\007\000\000\000\000\000\000\000' > "$variable"
+}
+
+mark_success()
+{
+	pmc=$(find_pmc) || {
+		printf '%s: PMC rootfs status controls are unavailable\n' "$program" >&2
+		return 1
+	}
+	current=$(cat "$pmc/rootfs_current" 2>/dev/null || printf unknown)
+	case "$current" in
+		0) retry_node=$pmc/rootfs_retry_count_a ;;
+		1) retry_node=$pmc/rootfs_retry_count_b ;;
+		*)
+			printf '%s: invalid current rootfs slot: %s\n' "$program" "$current" >&2
+			return 1
+			;;
+	esac
+	printf '%s\n' "$retry_max" > "$retry_node"
+	readback=$(cat "$retry_node")
+	[ "$readback" = "$retry_max" ] || {
+		printf '%s: retry counter verification failed: %s\n' "$program" "$readback" >&2
+		return 1
+	}
+	mkdir -p /run
+	printf 'slot=%s\nretry_count=%s\n' "$current" "$readback" > \
+		/run/helm-boot-success
+	logger -t helm-boot-success \
+		"marked rootfs slot $current successful (retry count $readback)" || :
+}
+
+reset_for_install()
+{
+	result=1
+	if reset_slot_a_status; then
+		printf 'RootfsStatusSlotA=normal\n'
+		result=0
+	else
+		printf '%s: EFI slot-A status was not reset\n' "$program" >&2
+	fi
+	if pmc=$(find_pmc); then
+		if [ -w "$pmc/rootfs_sr_magic" ] && \
+			printf '0\n' > "$pmc/rootfs_sr_magic"
+		then
+			printf 'rootfs_sr_magic=reset\n'
+			result=0
+		fi
+	fi
+	return "$result"
+}
+
+case ${1:-mark} in
+	mark) mark_success ;;
+	reset) reset_for_install ;;
+	*)
+		printf 'usage: %s [mark|reset]\n' "$program" >&2
+		exit 64
+		;;
+esac

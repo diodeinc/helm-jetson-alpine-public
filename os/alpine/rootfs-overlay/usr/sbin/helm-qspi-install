@@ -16,7 +16,11 @@ checksum=/opt/helm/payload/helm-qspi.img.sha256
 backup=
 confirm=
 expected_size=67108864
-expected_erase_size=65536
+# NVIDIA's QSPI layout and BCT redundancy use a 64 KiB stride, but that is
+# not Linux's MTD erase geometry. The pinned R39 kernel enables
+# CONFIG_MTD_SPI_NOR_USE_4K_SECTORS and exposes 4096 through both sysfs and
+# MEMGETINFO; flashcp uses that live kernel value for its erase operations.
+expected_mtd_erase_size=4096
 
 if [ -r "$metadata" ]; then
 	staged_profile=$(awk -F= '$1 == "PROFILE_ID" { print $2; exit }' "$metadata")
@@ -69,6 +73,11 @@ module_matches_sku()
 	esac
 }
 
+mtd_geometry_supported()
+{
+	[ "$1:$2" = "$expected_size:$expected_mtd_erase_size" ]
+}
+
 self_test()
 {
 	profile_identity_supported helm-orin-nx-16gb-r39.2 3767 0000 0x7323
@@ -79,7 +88,11 @@ self_test()
 	! profile_identity_supported helm-orin-nano-8gb-r39.2 3767 0005 0x7523
 	module_matches_sku '699-13767-0003-500' 0003
 	! module_matches_sku '699-13767-0005-500' 0003
-	printf '%s: profile and EEPROM guards passed\n' "$program"
+	mtd_geometry_supported 67108864 4096
+	! mtd_geometry_supported 67108864 65536
+	! mtd_geometry_supported 33554432 4096
+	! mtd_geometry_supported 67108864 invalid
+	printf '%s: profile, EEPROM, and MTD geometry guards passed\n' "$program"
 }
 
 load_profile()
@@ -104,7 +117,7 @@ validate_module()
 		for eeprom in /sys/bus/i2c/devices/*-0050/eeprom; do
 			[ -r "$eeprom" ] || continue
 			part_number=$(dd if="$eeprom" bs=1 skip=20 count=30 2>/dev/null | \
-				tr -cd '[:print:]')
+				tr -cd ' -~')
 			if module_matches_sku "$part_number" "$expected_sku"; then
 				module_part_number=$part_number
 				return 0
@@ -147,10 +160,10 @@ validate_geometry()
 	base=${device##*/}
 	actual_size=$(cat "/sys/class/mtd/$base/size")
 	actual_erase_size=$(cat "/sys/class/mtd/$base/erasesize")
-	[ "$actual_size" -eq "$expected_size" ] || \
+	[ "$actual_size" = "$expected_size" ] || \
 		die "MTD size is $actual_size, expected $expected_size"
-	[ "$actual_erase_size" -eq "$expected_erase_size" ] || \
-		die "erase size is $actual_erase_size, expected $expected_erase_size"
+	mtd_geometry_supported "$actual_size" "$actual_erase_size" || \
+		die "MTD erase size is $actual_erase_size, expected $expected_mtd_erase_size"
 }
 
 validate_image()

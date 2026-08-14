@@ -26,7 +26,14 @@ fi
 
 echo "  Model: $(read_dt_string /proc/device-tree/model)"
 echo "  Kernel: $(uname -r)"
-echo "  Root: $(findmnt -n -o SOURCE / 2>/dev/null || echo unknown)"
+root_source=$(awk '$2 == "/" { print $1; exit }' /proc/mounts 2>/dev/null || :)
+[ -n "$root_source" ] || root_source=unknown
+echo "  Root: $root_source"
+
+if [ -r /run/helm-boot-success ]; then
+	echo "  Boot success:"
+	sed 's/^/    /' /run/helm-boot-success
+fi
 
 if [ -r /run/helm-peripherals ]; then
 	echo "  Peripheral initialization:"

@@ -65,6 +65,7 @@ bootkit_work_dir=$build_dir/work/t234-bootkit
 bootkit_tools_dir=$bootkit_work_dir/tools
 loader=$bootkit_work_dir/macos-rcm/jetson-rcm
 family_builder=$script_dir/build-r39-family-inputs.py
+provision_console=$script_dir/helm-provision-console.py
 family_source_dir=$build_dir/work/r39.2-family-source
 family_capsule=$family_source_dir/opt/ota_package/t23x/TEGRA_BL_3767.Cap
 family_profile_dir=$build_dir/family-inputs/r39.2/$profile_id
@@ -97,6 +98,7 @@ Native Apple-silicon macOS commands:
   probe       inspect the attached T234 recovery interface (read-only)
   verify      verify the six-file RCM bundle (read-only)
   boot        volatile RAM-boot the recovery installer (does not write storage)
+  provision   RAM-boot recovery, then install confirmed NVMe and QSPI over USB
   install-help show the guarded command to run on the Jetson recovery console
 
 The default profile is helm-orin-nx-8gb-r39.2. No command here runs Docker, a
@@ -355,8 +357,11 @@ doctor()
 build_all()
 {
 	require_macos
+	ensure_bootloader_package
 	"$repo_dir/tools/apx-macos/build.sh"
-	HELM_ALPINE_BUILD_DIR=$alpine_build_dir "$repo_dir/os/alpine/build.sh"
+	HELM_ALPINE_BUILD_DIR=$alpine_build_dir \
+	HELM_R39_BOOTLOADER_DEB=$bootloader_deb \
+		"$repo_dir/os/alpine/build.sh"
 	build_bootkit
 }
 
@@ -494,11 +499,17 @@ build_provisioning_boot()
 	need_file "$alpine_build_dir/work/rootfs/boot/Image"
 	clean_directory "$provision_dir"
 	cp -a "$recovery_source/." "$provision_dir/"
+	# Keep both installers self-contained. A customer needs only the recovery
+	# USB cable: no second network, host-side upload, or Linux environment.
+	need_file "$provision_dir/opt/helm/payload/helm-rootfs.tar.zst"
+	install -m 0644 "$qspi_image" \
+		"$provision_dir/opt/helm/payload/helm-qspi.img"
 	install -m 0755 \
 		"$repo_dir/os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install" \
 		"$provision_dir/usr/sbin/helm-qspi-install"
-	install -m 0644 "$qspi_image" \
-		"$provision_dir/opt/helm/payload/helm-qspi.img"
+	install -m 0755 \
+		"$repo_dir/os/alpine/rootfs-overlay/usr/sbin/helm-provision" \
+		"$provision_dir/usr/sbin/helm-provision"
 	install -m 0644 "$qspi_catalog/manifest.json" \
 		"$provision_dir/opt/helm/payload/helm-qspi-manifest.json"
 	cat > "$provision_dir/opt/helm/payload/helm-profile" <<EOF
@@ -509,8 +520,12 @@ USB_PID=$profile_usb_pid
 EOF
 	(
 		cd "$provision_dir/opt/helm/payload"
-		shasum -a 256 helm-qspi.img > helm-qspi.img.sha256
+		qspi_sha=$(shasum -a 256 "$qspi_image" | awk '{print $1}')
+		printf '%s  helm-qspi.img\n' "$qspi_sha" > helm-qspi.img.sha256
 	)
+	need_file "$provision_dir/opt/helm/payload/helm-qspi.img"
+	test "$(wc -c < "$provision_dir/opt/helm/payload/helm-qspi.img" | tr -d ' ')" = \
+		67108864 || die "embedded QSPI image is not 64 MiB"
 
 	spi_module=$(find "$provision_dir/lib/modules" \
 		-type f -name spi-tegra210-quad.ko -print | head -n 1)
@@ -530,7 +545,7 @@ EOF
 	python3 "$script_dir/mkbootimg.py" \
 		--kernel "$alpine_build_dir/work/rootfs/boot/Image" \
 		--ramdisk "$provision_initramfs" \
-		--cmdline "rdinit=/init rw console=ttyTCU0,115200 console=tty0 firmware_class.path=/lib/firmware pci=pcie_bus_perf nvme.use_threaded_interrupts=1" \
+		--cmdline "rdinit=/init rw console=tty0 console=ttyTCU0,115200 firmware_class.path=/lib/firmware pci=pcie_bus_perf nvme.use_threaded_interrupts=1" \
 		--output "$provision_boot"
 }
 
@@ -549,7 +564,7 @@ bundle()
 		mce_flash_o10_cr_prod_sigheader.bin.encrypt \
 		tsec_t234_sigheader.bin.encrypt \
 		applet_t234_sigheader.bin.encrypt \
-		mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt \
+		mb2_t234_with_mb2_cold_boot_bct_MB2_sigheader.bin.encrypt \
 		xusb_t234_prod_sigheader.bin.encrypt \
 		nvpva_020_sigheader.fw.encrypt \
 		nvdec_t234_prod_sigheader.fw.encrypt \
@@ -608,7 +623,8 @@ EOF
 			psc_bl1_t234_prod_aligned_sigheader.bin.encrypt \
 			mb1_bct_MB1_sigheader.bct.encrypt \
 			mem_rcm_sigheader.bct.encrypt \
-			blob.bin > SHA256SUMS
+			blob.bin \
+			PROFILE > SHA256SUMS
 	)
 	verify
 	printf 'Native R39.2 RAM-recovery bundle: %s\n' "$bundle_dir"
@@ -618,11 +634,121 @@ verify()
 {
 	build_bootkit
 	need_file "$bundle_dir/SHA256SUMS"
+	need_file "$bundle_dir/PROFILE"
+	for identity in \
+		"PROFILE=$profile_id-ram-recovery" \
+		"BSP_RELEASE=39.2" \
+		"BOARD=P3767-$profile_sku" \
+		"CARRIER=Diode_Helm" \
+		"HOST_BOOT_PERSISTENT_WRITE=none" \
+		"USB_PID=$profile_usb_pid" \
+		"QSPI_PROFILE=$profile_id" \
+		"KERNEL_DTB=$profile_kernel_dtb"
+	do
+		[ "$(grep -Fxc -- "$identity" "$bundle_dir/PROFILE")" -eq 1 ] || \
+			die "bundle identity mismatch: $identity"
+	done
+	[ "$(awk '$2 == "PROFILE" { count++ } END { print count + 0 }' \
+		"$bundle_dir/SHA256SUMS")" -eq 1 ] || \
+		die "bundle PROFILE is not covered exactly once by SHA256SUMS"
 	(
 		cd "$bundle_dir"
 		shasum -a 256 -c SHA256SUMS
 	)
 	"$loader" verify "$bundle_dir"
+}
+
+provision()
+{
+	device=
+	device_seen=0
+	confirm_device=
+	confirm_device_seen=0
+	confirm_profile=
+	confirm_profile_seen=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--device)
+				[ "$#" -ge 2 ] || die "--device needs a value"
+				[ "$device_seen" -eq 0 ] || die "--device may be specified only once"
+				device=$2
+				device_seen=1
+				shift 2
+				;;
+			--confirm-device)
+				[ "$#" -ge 2 ] || die "--confirm-device needs a value"
+				[ "$confirm_device_seen" -eq 0 ] || \
+					die "--confirm-device may be specified only once"
+				confirm_device=$2
+				confirm_device_seen=1
+				shift 2
+				;;
+			--confirm-profile)
+				[ "$#" -ge 2 ] || die "--confirm-profile needs a value"
+				[ "$confirm_profile_seen" -eq 0 ] || \
+					die "--confirm-profile may be specified only once"
+				confirm_profile=$2
+				confirm_profile_seen=1
+				shift 2
+				;;
+			-h|--help)
+				cat <<EOF
+usage: $0 --profile PROFILE provision \\
+  --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \\
+  --confirm-profile PROFILE
+
+This verifies and RAM-boots the exact profile bundle, waits for the new recovery
+CDC console while excluding every pre-existing /dev/cu.usbmodem* device, then
+runs the guarded target-side NVMe + QSPI provisioner. It is destructive only
+after all three values match exactly.
+EOF
+				exit 0
+				;;
+			*) die "unknown provision argument: $1" ;;
+		esac
+	done
+	[ -n "$device" ] || die "provision requires --device"
+	case "$device" in
+		/dev/nvme[0-9]n[0-9]) ;;
+		*) die "provision only accepts a whole NVMe namespace: $device" ;;
+	esac
+	[ "$confirm_device" = "$device" ] || \
+		die "--confirm-device must exactly equal $device"
+	[ "$confirm_profile" = "$profile_id" ] || \
+		die "--confirm-profile must exactly equal $profile_id"
+
+	require_macos
+	need_command python3
+	need_file "$provision_console"
+	verify
+	existing_modems=$(mktemp "${TMPDIR:-/tmp}/helm-existing-modems.XXXXXX")
+	trap 'rm -f "$existing_modems"' EXIT HUP INT TERM
+	for modem in /dev/cu.usbmodem*; do
+		[ -e "$modem" ] || continue
+		printf '%s\n' "$modem" >> "$existing_modems"
+	done
+	printf 'Pre-existing USB serial devices are excluded from recovery control:\n'
+	if [ -s "$existing_modems" ]; then
+		sed 's/^/  /' "$existing_modems"
+	else
+		printf '  (none)\n'
+	fi
+	printf 'Starting volatile RAM recovery. Persistent writes require target preflight.\n'
+	"$loader" --pid "$profile_usb_pid" boot "$bundle_dir"
+
+	set -- "$provision_console" \
+		--profile "$profile_id" \
+		--device "$device" \
+		--connect-timeout "${HELM_PROVISION_CONNECT_TIMEOUT:-180}" \
+		--ready-timeout "${HELM_PROVISION_READY_TIMEOUT:-30}" \
+		--operation-timeout "${HELM_PROVISION_OPERATION_TIMEOUT:-1800}"
+	while IFS= read -r modem; do
+		[ -n "$modem" ] || continue
+		set -- "$@" --exclude "$modem"
+	done < "$existing_modems"
+	python3 "$@"
+	rm -f "$existing_modems"
+	trap - EXIT HUP INT TERM
 }
 
 command_name=${1:-}
@@ -663,6 +789,10 @@ case "$command_name" in
 		printf 'Starting volatile RAM recovery; this host command does not write storage.\n'
 		exec "$loader" --pid "$profile_usb_pid" boot "$bundle_dir"
 		;;
+	provision)
+		shift
+		provision "$@"
+		;;
 	install-help)
 		cat <<EOF
 On the Helm debug UART after RAM recovery boots:
@@ -675,6 +805,12 @@ On the Helm debug UART after RAM recovery boots:
   helm-qspi-install install --device /dev/mtd0 \
     --backup /mnt/helm-root/root/qspi-before.img \
     --confirm $profile_id
+
+Or run the same guarded sequence from the Mac over the recovery USB cable:
+
+  $0 --profile $profile_id provision \
+    --device /dev/nvme0n1 --confirm-device /dev/nvme0n1 \
+    --confirm-profile $profile_id
 
 The NVMe and QSPI install commands are destructive. QSPI install first writes a
 complete backup onto the mounted NVMe, then requires exact profile confirmation.

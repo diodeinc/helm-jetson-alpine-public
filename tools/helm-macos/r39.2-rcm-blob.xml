@@ -6,7 +6,7 @@
   <file name="mce_flash_o10_cr_prod_sigheader.bin.encrypt" type="mts_mce" />
   <file name="tsec_t234_sigheader.bin.encrypt" type="tsec_fw" />
   <file name="applet_t234_sigheader.bin.encrypt" type="mb2_applet" />
-  <file name="mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt" type="mb2_bootloader" />
+  <file name="mb2_t234_with_mb2_cold_boot_bct_MB2_sigheader.bin.encrypt" type="mb2_bootloader" />
   <file name="xusb_t234_prod_sigheader.bin.encrypt" type="xusb_fw" />
   <file name="nvpva_020_sigheader.fw.encrypt" type="pva_fw" />
   <file name="helm-dce-fw.bin" type="dce_fw" />

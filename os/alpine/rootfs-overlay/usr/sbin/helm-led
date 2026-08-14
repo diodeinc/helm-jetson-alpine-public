@@ -3,20 +3,70 @@ set -eu
 
 usage()
 {
-	echo "usage: helm-led <green|orange> <on|off|heartbeat|activity>" >&2
+	cat >&2 <<EOF
+usage:
+  helm-led <green|orange> <on|off|heartbeat|activity>
+  helm-led demo
+EOF
 }
 
 [ "${1:-}" != help ] || { usage; exit 0; }
+
+green_directory=/sys/class/leds/helm:green:status
+orange_directory=/sys/class/leds/helm:orange:activity
+
+restore_defaults()
+{
+	[ ! -w "$green_directory/trigger" ] || \
+		echo heartbeat > "$green_directory/trigger"
+	[ ! -w "$orange_directory/trigger" ] || \
+		echo disk-activity > "$orange_directory/trigger"
+}
+
+if [ "${1:-}" = demo ] && [ "$#" -eq 1 ]; then
+	[ -d "$green_directory" ] || { echo "green Helm LED is not present" >&2; exit 2; }
+	[ -d "$orange_directory" ] || { echo "orange Helm LED is not present" >&2; exit 2; }
+	trap restore_defaults EXIT HUP INT TERM
+	echo none > "$green_directory/trigger"
+	echo none > "$orange_directory/trigger"
+
+	# A short two-LED boot dance: chase, crossfade illusion, then a finish flash.
+	round=0
+	while [ "$round" -lt 4 ]; do
+		echo 1 > "$green_directory/brightness"
+		echo 0 > "$orange_directory/brightness"
+		sleep 0.12
+		echo 1 > "$orange_directory/brightness"
+		sleep 0.06
+		echo 0 > "$green_directory/brightness"
+		sleep 0.12
+		echo 0 > "$orange_directory/brightness"
+		sleep 0.06
+		round=$((round + 1))
+	done
+
+	round=0
+	while [ "$round" -lt 3 ]; do
+		echo 1 > "$green_directory/brightness"
+		echo 1 > "$orange_directory/brightness"
+		sleep 0.1
+		echo 0 > "$green_directory/brightness"
+		echo 0 > "$orange_directory/brightness"
+		sleep 0.1
+		round=$((round + 1))
+	done
+	exit 0
+fi
+
 [ "$#" -eq 2 ] || { usage; exit 64; }
 
 case "$1" in
-	green) led=helm:green:status ;;
-	orange) led=helm:orange:activity ;;
+	green) directory=$green_directory ;;
+	orange) directory=$orange_directory ;;
 	*) usage; exit 64 ;;
 esac
 
-directory=/sys/class/leds/$led
-[ -d "$directory" ] || { echo "$led is not present" >&2; exit 2; }
+[ -d "$directory" ] || { echo "${directory##*/} is not present" >&2; exit 2; }
 
 case "$2" in
 	on)

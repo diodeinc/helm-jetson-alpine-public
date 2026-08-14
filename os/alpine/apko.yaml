@@ -12,6 +12,7 @@ contents:
     - chrony-openrc
     - dhcpcd
     - dhcpcd-openrc
+    - dosfstools
     - dropbear
     - dropbear-openrc
     - e2fsprogs
@@ -20,6 +21,7 @@ contents:
     - eudev-openrc
     - i2c-tools
     - iproute2
+    - iperf3
     - kmod
     - libgpiod
     - lsblk
@@ -33,6 +35,40 @@ contents:
     - util-linux
     - usbutils
     - zstd
+
+accounts:
+  groups:
+    - groupname: chrony
+      gid: 101
+      members:
+        - chrony
+    - groupname: dhcpcd
+      gid: 102
+      members:
+        - dhcpcd
+  users:
+    - username: chrony
+      uid: 100
+      gid: 101
+      homedir: /dev/null
+      shell: /sbin/nologin
+    - username: dhcpcd
+      uid: 101
+      gid: 102
+      homedir: /var/lib/dhcpcd
+      shell: /sbin/nologin
+
+paths:
+  - path: /var/lib/chrony
+    type: permissions
+    uid: 100
+    gid: 101
+    permissions: 0o750
+  - path: /var/lib/dhcpcd
+    type: permissions
+    uid: 101
+    gid: 102
+    permissions: 0o750
 
 environment:
   PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

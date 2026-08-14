@@ -1,20 +1,21 @@
 #!/sbin/openrc-run
+# shellcheck shell=sh
 
 # OpenRC consumes these service-definition globals.
 # shellcheck disable=SC2034
 
-name="Helm peripheral initialization"
-description="Loads Helm carrier drivers and assigns status LED triggers"
+name="Helm rootfs boot success"
+description="Refreshes the NVIDIA rootfs retry counter after a successful boot"
 
 depend() {
-	need localmount
+	need localmount helm-peripherals
 	after modules udev udev-trigger
 	before dropbear
 }
 
 start() {
 	ebegin "$description"
-	/usr/sbin/helm-peripherals
+	/usr/sbin/helm-boot-success mark
 	eend $?
 }
 

@@ -30,7 +30,7 @@ TYPE_IDS = {
     "mts_mce": 8,
     "tsec_fw": 19,
     # R39.2 does not special-case this string in its mapper. tegrahost_v2
-    # emits its documented fallback value and still includes the component.
+    # emits its fallback value, which is the R39 T23x wire value for MB2A.
     "mb2_applet": 62,
     "mb2_bootloader": 6,
     "xusb_fw": 36,

@@ -52,6 +52,13 @@ BCH_STAGE1_SIZE_OFFSET = BCH_STAGE1_OFFSET + 4
 BCH_STAGE1_SHA_OFFSET = BCH_STAGE1_OFFSET + 0x50
 SHA512_SIZE = 64
 
+MB2_RAW_MAGIC = b"MB2B0234"
+R39_MB2_CVM_EEPROM_READ_SIZE_OFFSET = 0x9D40
+R39_MB2_CVB_EEPROM_READ_SIZE_OFFSET = 0x9D44
+R39_MB2_EEPROM_ADDRESS_OFFSET = 0x9D48
+R39_MB2_CVM_EEPROM_ADDRESS = 0xA0
+R39_MB2_CVB_EEPROM_ADDRESS = 0xAE
+
 MEM_DESCRIPTOR_OFFSET = 0x1400
 MEM_DESCRIPTOR_STRIDE = 0xA0
 MEM_DESCRIPTOR_SIZE_OFFSET = 4
@@ -393,6 +400,70 @@ def single_bch_payload(component: bytes, magic: bytes, label: str) -> bytes:
     return payload
 
 
+def rebuild_single_bch_payload(
+    component: bytes, magic: bytes, payload: bytes, label: str
+) -> bytes:
+    """Replace one zerosbk component payload and refresh all BCH digests."""
+
+    original = single_bch_payload(component, magic, label)
+    if len(payload) != len(original):
+        fail(f"{label} replacement payload changes the component size")
+
+    header = bytearray(component[:BCH_HEADER_SIZE])
+    digest = hashlib.sha512(payload).digest()
+    for descriptor, sha_offset in (
+        (BCH_STAGE2_OFFSET, BCH_STAGE2_SHA_OFFSET),
+        (BCH_STAGE1_OFFSET, BCH_STAGE1_SHA_OFFSET),
+    ):
+        struct.pack_into("<I", header, descriptor + 4, len(payload))
+        header[sha_offset : sha_offset + SHA512_SIZE] = digest
+    header[BCH_INNER_SHA_OFFSET : BCH_INNER_SHA_OFFSET + SHA512_SIZE] = (
+        hashlib.sha512(header[BCH_INNER_SHA_INPUT_OFFSET:]).digest()
+    )
+    header[BCH_OUTER_SHA_OFFSET : BCH_OUTER_SHA_OFFSET + SHA512_SIZE] = (
+        hashlib.sha512(header[BCH_OUTER_SHA_INPUT_OFFSET:]).digest()
+    )
+    rebuilt = bytes(header) + payload
+    if single_bch_payload(rebuilt, magic, f"patched {label}") != payload:
+        fail(f"{label} failed BCH reconstruction validation")
+    return rebuilt
+
+
+def disable_absent_cvb_eeprom(component: bytes, label: str) -> bytes:
+    """Retain the module EEPROM and disable Helm's absent carrier EEPROM."""
+
+    payload = bytearray(single_bch_payload(component, b"MB2B", label))
+    if payload.count(MB2_RAW_MAGIC) != 1:
+        fail(f"{label} does not contain exactly one R39 MB2 raw-BCT marker")
+    raw_offset = payload.index(MB2_RAW_MAGIC)
+    cvm_offset = raw_offset + R39_MB2_CVM_EEPROM_READ_SIZE_OFFSET
+    cvb_offset = raw_offset + R39_MB2_CVB_EEPROM_READ_SIZE_OFFSET
+    address_offset = raw_offset + R39_MB2_EEPROM_ADDRESS_OFFSET
+    if address_offset + 2 > len(payload):
+        fail(f"{label} MB2 raw BCT is truncated before its EEPROM fields")
+
+    cvm_size = struct.unpack_from("<I", payload, cvm_offset)[0]
+    cvb_size = struct.unpack_from("<I", payload, cvb_offset)[0]
+    addresses = bytes(payload[address_offset : address_offset + 2])
+    expected_addresses = bytes(
+        (R39_MB2_CVM_EEPROM_ADDRESS, R39_MB2_CVB_EEPROM_ADDRESS)
+    )
+    if cvm_size != 0x100:
+        fail(f"{label} has unexpected CVM EEPROM read size {cvm_size:#x}")
+    if cvb_size not in (0, 0x100):
+        fail(f"{label} has unexpected CVB EEPROM read size {cvb_size:#x}")
+    if addresses != expected_addresses:
+        fail(
+            f"{label} has unexpected CVM/CVB EEPROM addresses "
+            f"{addresses.hex()}, expected {expected_addresses.hex()}"
+        )
+    if cvb_size == 0:
+        return component
+
+    struct.pack_into("<I", payload, cvb_offset, 0)
+    return rebuild_single_bch_payload(component, b"MB2B", bytes(payload), label)
+
+
 def memory_slot_zero(component: bytes, label: str) -> bytes:
     header = validate_bch_hashes(component, label)
     ranges: list[tuple[int, int]] = []
@@ -572,6 +643,10 @@ def build_flash_index(
                 fail(f"no allowlisted BUP mapping for populated QSPI partition {partition}")
             payload = select_entry(entries, bup_name, profile.tnspec).payload
             filename = qspi_filename(original_filename, canonical, profile)
+            if canonical == "mb2":
+                payload = disable_absent_cvb_eeprom(
+                    payload, f"P3767-{profile.sku} {partition}"
+                )
         partition_size = int(row[3], 0)
         if len(payload) > partition_size:
             fail(
@@ -786,7 +861,10 @@ def build(arguments: argparse.Namespace) -> None:
     try:
         qspi_count, populated = build_flash_index(seed, temporary, entries, profile)
         for filename in COMMON_RCM_FILES:
-            put_file(temporary, filename, (seed / filename).read_bytes())
+            payload = (seed / filename).read_bytes()
+            if filename == "mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt":
+                payload = disable_absent_cvb_eeprom(payload, "R39 recovery MB2")
+            put_file(temporary, filename, payload)
         build_rcm_components(
             seed,
             temporary,
@@ -844,6 +922,59 @@ def self_test() -> None:
         fail("self-test exact BUP selection failed")
     if canonical_partition("A_MEM_BCT") != "MEM_BCT":
         fail("self-test QSPI canonicalization failed")
+
+    mb2_payload = bytearray(R39_MB2_EEPROM_ADDRESS_OFFSET + 0x100)
+    mb2_payload[: len(MB2_RAW_MAGIC)] = MB2_RAW_MAGIC
+    struct.pack_into(
+        "<I", mb2_payload, R39_MB2_CVM_EEPROM_READ_SIZE_OFFSET, 0x100
+    )
+    struct.pack_into(
+        "<I", mb2_payload, R39_MB2_CVB_EEPROM_READ_SIZE_OFFSET, 0x100
+    )
+    mb2_payload[
+        R39_MB2_EEPROM_ADDRESS_OFFSET : R39_MB2_EEPROM_ADDRESS_OFFSET + 2
+    ] = bytes((R39_MB2_CVM_EEPROM_ADDRESS, R39_MB2_CVB_EEPROM_ADDRESS))
+    mb2_header = bytearray(BCH_HEADER_SIZE)
+    mb2_header[:4] = BCH_MAGIC
+    mb2_digest = hashlib.sha512(mb2_payload).digest()
+    for descriptor, sha_offset in (
+        (BCH_STAGE2_OFFSET, BCH_STAGE2_SHA_OFFSET),
+        (BCH_STAGE1_OFFSET, BCH_STAGE1_SHA_OFFSET),
+    ):
+        mb2_header[descriptor : descriptor + 4] = b"MB2B"
+        struct.pack_into("<I", mb2_header, descriptor + 4, len(mb2_payload))
+        mb2_header[sha_offset : sha_offset + SHA512_SIZE] = mb2_digest
+    mb2_header[BCH_INNER_SHA_OFFSET : BCH_INNER_SHA_OFFSET + SHA512_SIZE] = (
+        hashlib.sha512(mb2_header[BCH_INNER_SHA_INPUT_OFFSET:]).digest()
+    )
+    mb2_header[BCH_OUTER_SHA_OFFSET : BCH_OUTER_SHA_OFFSET + SHA512_SIZE] = (
+        hashlib.sha512(mb2_header[BCH_OUTER_SHA_INPUT_OFFSET:]).digest()
+    )
+    mb2_component = bytes(mb2_header) + bytes(mb2_payload)
+    patched_mb2 = disable_absent_cvb_eeprom(mb2_component, "self-test MB2")
+    patched_payload = single_bch_payload(patched_mb2, b"MB2B", "patched fixture")
+    if struct.unpack_from(
+        "<I", patched_payload, R39_MB2_CVM_EEPROM_READ_SIZE_OFFSET
+    )[0] != 0x100:
+        fail("self-test MB2 mutation changed the module EEPROM read size")
+    if struct.unpack_from(
+        "<I", patched_payload, R39_MB2_CVB_EEPROM_READ_SIZE_OFFSET
+    )[0] != 0:
+        fail("self-test MB2 mutation did not disable the carrier EEPROM")
+    if disable_absent_cvb_eeprom(patched_mb2, "patched fixture") != patched_mb2:
+        fail("self-test MB2 mutation is not idempotent")
+
+    invalid_payload = bytearray(mb2_payload)
+    invalid_payload[R39_MB2_EEPROM_ADDRESS_OFFSET + 1] = 0xAC
+    invalid_mb2 = rebuild_single_bch_payload(
+        mb2_component, b"MB2B", bytes(invalid_payload), "invalid-address fixture"
+    )
+    try:
+        disable_absent_cvb_eeprom(invalid_mb2, "invalid-address fixture")
+    except SystemExit:
+        pass
+    else:
+        fail("self-test MB2 mutation accepted an unexpected EEPROM address")
     print("build-r39-family-inputs.py self-test passed")
 
 

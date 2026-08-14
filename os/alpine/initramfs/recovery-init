@@ -4,6 +4,7 @@ set -u
 
 bb=/bin/busybox
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+selected_usb_role=
 
 log()
 {
@@ -15,6 +16,52 @@ emergency_shell()
 	log "$1"
 	exec "$bb" sh < /dev/console > /dev/console 2>&1
 }
+
+usb_role_is_device()
+{
+	role_path=$1
+	role_value=
+	IFS= read -r role_value < "$role_path" 2>/dev/null || return 1
+	[ "$role_value" = device ]
+}
+
+set_recovery_usb_role()
+{
+	role_class=${1:-/sys/class/usb_role}
+	selected_usb_role=
+	# The stable class link is independent of the platform-device nesting.
+	# Helm exposes one role switch, for recovery USB2 pad 0.
+	for role_path in "$role_class"/*/role; do
+		[ -w "$role_path" ] || continue
+		printf 'device\n' > "$role_path" 2>/dev/null || continue
+		usb_role_is_device "$role_path" || continue
+		selected_usb_role=$role_path
+		return 0
+	done
+	return 1
+}
+
+recovery_init_self_test()
+{
+	test_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-recovery-role.XXXXXX") || return 1
+	trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
+	mkdir -p "$test_dir/usb2-0-role-switch"
+	printf 'none\n' > "$test_dir/usb2-0-role-switch/role"
+	set_recovery_usb_role "$test_dir"
+	[ "$selected_usb_role" = "$test_dir/usb2-0-role-switch/role" ]
+	usb_role_is_device "$selected_usb_role"
+	printf 'host\n' > "$selected_usb_role"
+	! usb_role_is_device "$selected_usb_role"
+	! set_recovery_usb_role "$test_dir/absent"
+	printf 'recovery-init: USB role-switch self-test passed\n'
+	rm -rf "$test_dir"
+	trap - EXIT HUP INT TERM
+}
+
+if [ "${1:-}" = self-test ]; then
+	recovery_init_self_test
+	exit 0
+fi
 
 mkdir -p /dev /dev/pts /proc /sys /run /tmp
 "$bb" mount -t devtmpfs devtmpfs /dev || emergency_shell "cannot mount devtmpfs"
@@ -33,35 +80,155 @@ load_module()
 	module=$("$bb" find "$module_dir" -type f -name "$name.ko" 2>/dev/null | \
 		"$bb" head -n 1)
 	if [ -n "$module" ]; then
-		"$bb" insmod "$module" 2>/dev/null || :
+		"$bb" insmod "$module" 2>/dev/null || log "could not load module $name"
 	fi
 }
 
-for module in at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme; do
+log "loading recovery drivers"
+for module in \
+	pwm-tegra pwm-fan \
+	at24 spi-tegra210-quad phy-tegra194-p2u pcie-tegra194 nvme-core nvme \
+	tegra-xudc libcomposite u_serial usb_f_acm u_ether usb_f_ncm
+do
 	load_module "$module"
 done
+log "recovery drivers loaded"
 
-if [ -x /sbin/udevd ]; then
-	/sbin/udevd --daemon || :
-	udevadm trigger --action=add || :
-	udevadm settle --timeout=10 || :
+# NVIDIA's EEPROM manager describes the CVM EEPROM outside the I2C bus node.
+# Instantiate the read path when at24 has not already claimed address 0x50.
+if [ ! -r /sys/bus/i2c/devices/0-0050/eeprom ]; then
+	for i2c_adapter in /sys/class/i2c-adapter/i2c-*; do
+		[ -r "$i2c_adapter/name" ] || continue
+		[ "$("$bb" cat "$i2c_adapter/name")" = "3160000.i2c" ] || continue
+		printf '24c02 0x50\n' > "$i2c_adapter/new_device" 2>/dev/null || :
+		break
+	done
 fi
 
-attempt=0
-while [ "$attempt" -lt 50 ]; do
-	set -- /dev/nvme[0-9]n[0-9]
-	[ -b "$1" ] && break
-	attempt=$((attempt + 1))
-	"$bb" sleep 0.1
-done
+(
+	attempt=0
+	while [ "$attempt" -lt 100 ]; do
+		for fan_pwm in /sys/class/hwmon/hwmon*/pwm1; do
+			[ -e "$fan_pwm" ] || continue
+			fan_enable=${fan_pwm%pwm1}pwm1_enable
+			[ ! -e "$fan_enable" ] || printf '1\n' > "$fan_enable" 2>/dev/null || :
+			printf '255\n' > "$fan_pwm" 2>/dev/null || continue
+			log "fan forced to full speed through $fan_pwm"
+			exit 0
+		done
+		attempt=$((attempt + 1))
+		"$bb" sleep 0.1
+	done
+	# The R35 fallback DTB can expose the fan PWM without instantiating
+	# pwm-fan. PWM1 (3280000.pwm) drives FAN_PWM on Helm/P3768.
+	for fan_chip in /sys/class/pwm/pwmchip*; do
+		[ -e "$fan_chip" ] || continue
+		[ "$("$bb" basename "$("$bb" readlink -f "$fan_chip/device")")" = \
+			"3280000.pwm" ] || continue
+		printf '0\n' > "$fan_chip/export" 2>/dev/null || :
+		[ -d "$fan_chip/pwm0" ] || continue
+		[ ! -e "$fan_chip/pwm0/enable" ] || \
+			printf '0\n' > "$fan_chip/pwm0/enable" 2>/dev/null || :
+		printf '45334\n' > "$fan_chip/pwm0/period" 2>/dev/null || continue
+		printf '45334\n' > "$fan_chip/pwm0/duty_cycle" 2>/dev/null || continue
+		printf '1\n' > "$fan_chip/pwm0/enable" 2>/dev/null || continue
+		log "fan forced to full speed through $fan_chip/pwm0"
+		exit 0
+	done
+	log "fan control node unavailable"
+) &
 
-log "Helm Alpine RAM recovery is ready"
+setup_usb_console()
+{
+	config_root=/sys/kernel/config
+	gadget=$config_root/usb_gadget/helm-recovery
+
+	"$bb" mount -t configfs configfs "$config_root" 2>/dev/null || \
+		[ -d "$config_root/usb_gadget" ] || return 1
+	"$bb" mkdir -p \
+		"$gadget/strings/0x409" \
+		"$gadget/configs/c.1/strings/0x409" \
+		"$gadget/functions/acm.usb0" \
+		"$gadget/functions/ncm.usb0"
+	printf '0x0955\n' > "$gadget/idVendor"
+	printf '0x7020\n' > "$gadget/idProduct"
+	printf '0xef\n' > "$gadget/bDeviceClass"
+	printf '0x02\n' > "$gadget/bDeviceSubClass"
+	printf '0x01\n' > "$gadget/bDeviceProtocol"
+	printf 'Diode Inc.\n' > "$gadget/strings/0x409/manufacturer"
+	printf 'Helm Alpine Recovery Console\n' > "$gadget/strings/0x409/product"
+	printf 'helm-recovery\n' > "$gadget/strings/0x409/serialnumber"
+	printf 'CDC serial console\n' > "$gadget/configs/c.1/strings/0x409/configuration"
+	"$bb" ln -s "$gadget/functions/acm.usb0" "$gadget/configs/c.1/acm.usb0"
+	"$bb" ln -s "$gadget/functions/ncm.usb0" "$gadget/configs/c.1/ncm.usb0"
+
+	udc=
+	for candidate in /sys/class/udc/*; do
+		[ -e "$candidate" ] || continue
+		udc=${candidate##*/}
+		break
+	done
+	[ -n "$udc" ] || return 1
+	set_recovery_usb_role || {
+		log "recovery USB role switch did not accept device mode"
+		return 1
+	}
+	usb_role_is_device "$selected_usb_role" || return 1
+	log "recovery USB role switched to device through $selected_usb_role"
+	printf '%s\n' "$udc" > "$gadget/UDC" || return 1
+	# Fail closed if the role changed while the UDC was being bound.
+	usb_role_is_device "$selected_usb_role" || {
+		printf '\n' > "$gadget/UDC" 2>/dev/null || :
+		return 1
+	}
+
+	attempt=0
+	while [ "$attempt" -lt 50 ] && [ ! -c /dev/ttyGS0 ]; do
+		attempt=$((attempt + 1))
+		"$bb" sleep 0.1
+	done
+	[ -c /dev/ttyGS0 ] || return 1
+
+	attempt=0
+	while [ "$attempt" -lt 50 ] && [ ! -d /sys/class/net/usb0 ]; do
+		attempt=$((attempt + 1))
+		"$bb" sleep 0.1
+	done
+	if [ -d /sys/class/net/usb0 ]; then
+		ip address add 192.168.55.1/24 dev usb0 2>/dev/null || :
+		ip link set usb0 up || :
+	fi
+	return 0
+}
+
+recovery_banner()
 {
 	printf '\nHelm Alpine RAM recovery\n'
-	printf 'This environment has not written QSPI or NVMe.\n\n'
-	/usr/sbin/helm-install inspect
-	printf '\nTo install after checking the target:\n'
-	printf '  helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1\n\n'
-} > /dev/console 2>&1
+	printf 'Booting recovery alone does not write QSPI or NVMe.\n'
+	printf 'Only an explicit install or provision command writes storage.\n\n'
+	printf 'Recovery USB: CDC console plus NCM network at 192.168.55.1/24.\n'
+	printf 'Alpine and QSPI payloads are embedded; no network upload is required.\n\n'
+}
 
-exec "$bb" sh < /dev/console > /dev/console 2>&1
+log "Helm Alpine RAM recovery is ready"
+recovery_banner > /dev/console 2>&1
+
+(
+	if setup_usb_console; then
+		log "recovery USB is ready as CDC serial plus NCM"
+		while :; do
+			recovery_banner > /dev/ttyGS0 2>&1 || :
+			"$bb" sh < /dev/ttyGS0 > /dev/ttyGS0 2>&1 || :
+			log "recovery USB console exited; restarting"
+			"$bb" sleep 0.2
+		done
+	fi
+	log "recovery USB console unavailable; debug UART remains ready"
+) &
+
+# Keep the interactive UART shell out of PID 1. A typo, `exit`, or `set -e`
+# inside the console must restart that shell, never panic the recovery kernel.
+while :; do
+	"$bb" sh < /dev/console > /dev/console 2>&1 || :
+	log "debug UART shell exited; restarting"
+done

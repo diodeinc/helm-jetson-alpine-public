@@ -99,8 +99,9 @@ exact SKU. Substituting a nearby SKU, BSP version, fuse policy, or carrier BCT
 is unsafe and unsupported.
 
 All five derived catalogs, fixed QSPI images, and native recovery bundles pass
-local structural verification. Physical RAM boot and destructive QSPI/cold
-boot qualification remain separate hardware bring-up gates.
+local structural verification. P3767-0001 has also completed physical RAM
+boot, full QSPI write/readback, NVMe installation, and cold boot; physical
+qualification of the other four exact-SKU bundles remains a separate gate.
 
 ## Commands
 
@@ -124,13 +125,38 @@ export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/qualified-p3767-0001/signed
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 probe
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 verify
 ./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 boot
+
+profile=helm-orin-nx-8gb-r39.2
+./tools/helm-macos/helm-macos --profile "$profile" provision \
+  --device /dev/nvme0n1 \
+  --confirm-device /dev/nvme0n1 \
+  --confirm-profile "$profile"
 ```
 
 `probe` is read-only. `verify` only reads local files. `boot` consumes the
 BootROM RCM session and boots Linux in RAM, but does not send a persistent
-flash command or write target storage.
+flash command or write target storage. `provision` is the deliberately
+destructive, single-recovery-cable customer path: it first performs the same
+exact-bundle verification and volatile boot, excludes every serial device that
+existed before boot, and connects only when the new serial node's nearest IOKit
+`IOUSBHostDevice` parent exactly matches `0955:7020`, product
+`Helm Alpine Recovery Console`, and serial `helm-recovery`. A newly connected
+MCP2221 or any other `usbmodem` is rejected. Its serial transport uses Python's
+standard library; no `pyserial` or other package is required.
 
-After recovery reaches the debug UART:
+The target-side `helm-provision` command repeats the exact device and profile
+guards, runs both existing installers in read-only inspect mode before writing,
+installs NVMe, mounts partition 1 for the mandatory full QSPI backup, installs
+and readback-verifies QSPI, then syncs and unmounts. The host accepts only a
+complete success line carrying its random session token and the requested
+profile/device. Connection readiness and the overall operation have finite
+timeouts. If the host loses the console after writes start, leave power
+connected and inspect the recovery UART; absence of verified success is never
+reported as success.
+
+After recovery re-enumerates the same cable as a CDC serial port, open the new
+`/dev/cu.usbmodem*` at 115200 baud. The onboard debug UART is an optional
+bring-up fallback. In that recovery shell:
 
 ```sh
 helm-install inspect
@@ -144,8 +170,13 @@ helm-qspi-install install --device /dev/mtd0 \
 ```
 
 The two `install` commands are destructive. NVMe installation is restricted
-to the exactly confirmed whole namespace. QSPI installation additionally
-requires the exact profile, validates the module EEPROM, MTD geometry, and
-payload integrity, creates a complete backup on the mounted NVMe, and checks a
-full readback. All five QSPI catalogs and raw images are structurally verified;
-the first physical write and cold-boot qualification are still pending.
+to the exactly confirmed whole namespace and selects the premerged Helm DTB
+matching the family bundle's validated P3767 `BOARD_SKU`. QSPI installation
+additionally requires the exact profile, validates the module EEPROM, MTD
+geometry, and payload integrity, creates a complete backup on the mounted NVMe,
+and checks a full readback. All five QSPI catalogs and raw images are
+structurally verified. P3767-0001 has passed physical write/readback and cold
+boot. A second P3767-0001 passed the complete guarded `provision` command with
+recovery USB only and no UART, including QSPI backup, write, full readback, and
+the host-verified session marker. The other four exact-SKU images have not yet
+been physically qualified.
