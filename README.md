@@ -162,8 +162,8 @@ The tailnet-only browser prototype is available in current desktop Chrome or
 Chromium at
 <https://preview.example.invalid/helm>. Connect exactly one Helm,
 keep it powered, and use its recovery USB port. It is still one physical cable,
-but the browser asks once for APX WebUSB access and again for the re-enumerated
-recovery Web Serial port.
+but the browser asks for BootROM WebUSB access, MB1/PSC WebUSB access after APX
+re-enumerates, and finally the recovery Web Serial port.
 
 The page downloads only the selected exact-SKU bundle, verifies every file
 against the same-origin catalog and embedded SHA256SUMS, and performs a

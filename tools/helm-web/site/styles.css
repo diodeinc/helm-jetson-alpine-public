@@ -607,6 +607,107 @@ input:disabled {
   margin: 0;
 }
 
+.install-progress {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.install-target {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  margin: 0 0 12px;
+}
+
+.install-target > div {
+  min-width: 0;
+}
+
+.install-target dt,
+.install-stage-state {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.57rem;
+  text-transform: uppercase;
+}
+
+.install-target dd {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.install-stages {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  list-style: none;
+  margin: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.install-stages li {
+  align-items: center;
+  display: grid;
+  font-size: 0.72rem;
+  gap: 9px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  padding: 8px 10px;
+}
+
+.install-stages li + li {
+  border-top: 1px solid var(--line);
+}
+
+.install-stage-number {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.61rem;
+}
+
+.install-stages li[data-state="active"] {
+  background: var(--accent-soft);
+}
+
+.install-stages li[data-state="active"] .install-stage-number,
+.install-stages li[data-state="active"] .install-stage-state {
+  color: var(--accent);
+}
+
+.install-stages li[data-state="complete"] .install-stage-number,
+.install-stages li[data-state="complete"] .install-stage-state {
+  color: var(--success);
+}
+
+.install-stages li[data-state="failed"] {
+  background: var(--danger-soft);
+}
+
+.install-stages li[data-state="failed"] .install-stage-number,
+.install-stages li[data-state="failed"] .install-stage-state {
+  color: var(--danger);
+}
+
+body.install-active .checks,
+body.install-active .hardware-gate,
+body.install-active .steps {
+  display: none;
+}
+
+body.install-active .intro {
+  margin-bottom: 14px;
+}
+
+body.install-active .intro p {
+  display: none;
+}
+
+body.install-state-unknown .progress-panel progress {
+  display: none;
+}
+
 .console {
   margin-top: 14px;
   overflow: hidden;
@@ -735,6 +836,10 @@ input:disabled {
 
   .inventory-hash-row {
     grid-column: auto;
+  }
+
+  .install-target {
+    grid-template-columns: 1fr;
   }
 
   .button {

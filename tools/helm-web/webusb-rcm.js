@@ -12,10 +12,18 @@ export const BOOTLOADER_BANNER_SIZE = 0x44;
 
 export const DEFAULT_TIMEOUTS = Object.freeze({
   usb: 5_000,
-  handoff: 30_000,
   banner: 30_000,
   reopen: 5_000,
-  poll: 100,
+});
+
+const handoffStates = new WeakMap();
+
+const HANDOFF_PHASE = Object.freeze({
+  awaitingGrant: "awaitingGrant",
+  chooserPending: "chooserPending",
+  granted: "granted",
+  consuming: "consuming",
+  consumed: "consumed",
 });
 
 export class ApxWebUsbError extends Error {
@@ -455,43 +463,6 @@ async function assertAuthorizedSelection(usb, selectedDevice, identity) {
   }
 }
 
-async function defaultSleep(milliseconds) {
-  await new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
-}
-
-async function waitForHandoffDevice(usb, previousDevice, identity, options) {
-  const started = options.now();
-  let observedDetach = false;
-  while (options.now() - started < options.timeoutMs) {
-    const authorized = await usb.getDevices();
-    const matches = authorized.filter((device) => identityMatches(device, identity));
-    if (matches.length > 1) {
-      fail(
-        `found ${matches.length} authorized APX devices with ` +
-        `${formatUsbId(identity.productId)}; expected exactly one`,
-      );
-    }
-    if (matches.length === 0) {
-      observedDetach = true;
-    } else {
-      const sawTransition = observedDetach || options.didDisconnect();
-      if (identity.serialNumber !== null) {
-        if (matches[0] !== previousDevice || sawTransition) {
-          return matches[0];
-        }
-      } else if (sawTransition) {
-        // With no serial or physical path, accepting a merely different object
-        // could silently switch boards. Require an observed disconnect first.
-        return matches[0];
-      }
-    }
-    await options.sleep(options.pollMs);
-  }
-  throw new ApxTimeoutError(
-    `T234 device did not return for bootloader stage after ${options.timeoutMs} ms`,
-  );
-}
-
 export class T234WebUsbRcm {
   constructor(options = {}) {
     this.usb = options.usb ?? globalThis.navigator?.usb;
@@ -503,8 +474,6 @@ export class T234WebUsbRcm {
     }
     this.timeouts = Object.freeze({ ...DEFAULT_TIMEOUTS, ...options.timeouts });
     this.timeoutRunner = options.timeoutRunner ?? withTimeout;
-    this.sleep = options.sleep ?? defaultSleep;
-    this.now = options.now ?? (() => Date.now());
   }
 
   async requestDevice(bundle) {
@@ -514,7 +483,48 @@ export class T234WebUsbRcm {
     return requestApxDevice(this.usb, bundle.profile.productId);
   }
 
-  async boot(device, bundle, options = {}) {
+  async requestBootloaderDevice(handoff) {
+    const saved = handoffStates.get(handoff);
+    if (!saved || saved.owner !== this) {
+      throw new ApxWebUsbError(
+        "bootloader selection requires this transport's completed BootROM handoff",
+      );
+    }
+    if (saved.phase === HANDOFF_PHASE.chooserPending) {
+      throw new ApxWebUsbError("bootloader device selection is already pending");
+    }
+    if (saved.phase !== HANDOFF_PHASE.awaitingGrant) {
+      throw new ApxWebUsbError(
+        "bootloader device selection has already completed for this handoff",
+      );
+    }
+
+    saved.phase = HANDOFF_PHASE.chooserPending;
+    saved.secondGrantDevice = null;
+    let device;
+    try {
+      device = await requestApxDevice(this.usb, saved.productId);
+    } catch (error) {
+      if (handoffStates.get(handoff) === saved &&
+          saved.phase === HANDOFF_PHASE.chooserPending) {
+        saved.phase = HANDOFF_PHASE.awaitingGrant;
+        saved.secondGrantDevice = null;
+      }
+      throw error;
+    }
+
+    if (handoffStates.get(handoff) !== saved || saved.owner !== this ||
+        saved.phase !== HANDOFF_PHASE.chooserPending) {
+      throw new ApxWebUsbError(
+        "BootROM handoff is no longer active after bootloader selection",
+      );
+    }
+    saved.secondGrantDevice = device;
+    saved.phase = HANDOFF_PHASE.granted;
+    return device;
+  }
+
+  async bootrom(device, bundle, options = {}) {
     if (!isValidatedRcmBundle(bundle)) {
       throw new ApxWebUsbError("bundle must pass validateRcmBundle() first");
     }
@@ -522,13 +532,6 @@ export class T234WebUsbRcm {
 
     const identity = deviceIdentity(device);
     await assertAuthorizedSelection(this.usb, device, identity);
-    let disconnected = false;
-    const disconnectHandler = (event) => {
-      if (event.device === device || identityMatches(event.device, identity)) {
-        disconnected = true;
-      }
-    };
-    this.usb.addEventListener?.("disconnect", disconnectHandler);
 
     const transferState = {
       stage: "bootrom",
@@ -536,62 +539,110 @@ export class T234WebUsbRcm {
       bytesTotal: bundle.totalBytes,
     };
     let cid;
-    let banner;
+    safeProgress(options.onProgress, {
+      type: "phase",
+      phase: "bootrom",
+      message: "Reading BootROM CID and sending four signed artifacts",
+    });
+    let session = await openBulkSession(
+      device,
+      this.timeouts.usb,
+      this.timeoutRunner,
+    );
     try {
+      cid = await readBootromUid(
+        session,
+        this.timeouts.usb,
+        this.timeoutRunner,
+      );
+      safeProgress(options.onProgress, { type: "cid", cid });
+      await transferArtifactSet(
+        session,
+        RCM_BOOTROM_ARTIFACTS,
+        bundle,
+        transferState,
+        this.timeouts.usb,
+        this.timeoutRunner,
+        options.onProgress,
+      );
+    } finally {
+      await closeSession(session);
+    }
+
+    safeProgress(options.onProgress, {
+      type: "phase",
+      phase: "handoff",
+      message: "BootROM transfer complete; MB1/PSC needs a fresh browser grant",
+    });
+    const handoff = Object.freeze({
+      profile: bundle.profile,
+      cid,
+      bytesSent: transferState.bytesSent,
+    });
+    handoffStates.set(handoff, {
+      owner: this,
+      bundle,
+      productId: bundle.profile.productId,
+      identity,
+      phase: HANDOFF_PHASE.awaitingGrant,
+      secondGrantDevice: null,
+      cid,
+      bytesSent: transferState.bytesSent,
+    });
+    safeProgress(options.onProgress, { type: "handoff", ...handoff });
+    return handoff;
+  }
+
+  async bootloader(device, bundle, handoff, options = {}) {
+    if (!isValidatedRcmBundle(bundle)) {
+      throw new ApxWebUsbError("bundle must pass validateRcmBundle() first");
+    }
+    const saved = handoffStates.get(handoff);
+    if (!saved || saved.owner !== this || saved.bundle !== bundle ||
+        saved.productId !== bundle.profile.productId) {
+      throw new ApxWebUsbError(
+        "bootloader stage requires the matching completed BootROM handoff",
+      );
+    }
+    assertApxDevice(device, saved.productId);
+    if (saved.phase !== HANDOFF_PHASE.granted ||
+        device !== saved.secondGrantDevice) {
+      throw new ApxWebUsbError(
+        "bootloader stage requires the APX object returned by the fresh " +
+        "second chooser grant",
+      );
+    }
+    if (saved.identity.serialNumber !== null &&
+        device.serialNumber !== saved.identity.serialNumber) {
+      throw new ApxWebUsbError(
+        "bootloader APX serial does not match the selected BootROM device",
+      );
+    }
+
+    // Consume the handoff before the first await so concurrent callers cannot
+    // both pass validation and perform the one-shot stage-two transfer.
+    saved.phase = HANDOFF_PHASE.consuming;
+    handoffStates.delete(handoff);
+    try {
+      await assertAuthorizedSelection(this.usb, device, saved.identity);
+
+      const transferState = {
+        stage: "bootloader",
+        bytesSent: saved.bytesSent,
+        bytesTotal: bundle.totalBytes,
+      };
       safeProgress(options.onProgress, {
         type: "phase",
-        phase: "bootrom",
-        message: "Reading BootROM CID and sending four signed artifacts",
+        phase: "bootloader-banner",
+        message: "Reading MB1/PSC bootloader status",
       });
+
       let session = await openBulkSession(
         device,
         this.timeouts.usb,
         this.timeoutRunner,
       );
-      try {
-        cid = await readBootromUid(
-          session,
-          this.timeouts.usb,
-          this.timeoutRunner,
-        );
-        safeProgress(options.onProgress, { type: "cid", cid });
-        await transferArtifactSet(
-          session,
-          RCM_BOOTROM_ARTIFACTS,
-          bundle,
-          transferState,
-          this.timeouts.usb,
-          this.timeoutRunner,
-          options.onProgress,
-        );
-      } finally {
-        await closeSession(session);
-      }
-
-      safeProgress(options.onProgress, {
-        type: "phase",
-        phase: "handoff",
-        message: "Waiting for MB1/PSC bootloader handoff",
-      });
-      const bootloaderDevice = await waitForHandoffDevice(
-        this.usb,
-        device,
-        identity,
-        {
-          timeoutMs: this.timeouts.handoff,
-          pollMs: this.timeouts.poll,
-          sleep: this.sleep,
-          now: this.now,
-          didDisconnect: () => disconnected,
-        },
-      );
-      assertApxDevice(bootloaderDevice, bundle.profile.productId);
-
-      session = await openBulkSession(
-        bootloaderDevice,
-        this.timeouts.usb,
-        this.timeoutRunner,
-      );
+      let banner;
       try {
         banner = await readBootloaderBanner(
           session,
@@ -608,9 +659,8 @@ export class T234WebUsbRcm {
         phase: "bootloader",
         message: "Sending memory BCT and recovery blob",
       });
-      transferState.stage = "bootloader";
       session = await openBulkSession(
-        bootloaderDevice,
+        device,
         this.timeouts.reopen,
         this.timeoutRunner,
       );
@@ -636,14 +686,15 @@ export class T234WebUsbRcm {
       }
       const result = Object.freeze({
         profile: bundle.profile,
-        cid,
+        cid: saved.cid,
         banner,
         bytesSent: transferState.bytesSent,
       });
       safeProgress(options.onProgress, { type: "complete", ...result });
       return result;
     } finally {
-      this.usb.removeEventListener?.("disconnect", disconnectHandler);
+      saved.phase = HANDOFF_PHASE.consumed;
+      saved.secondGrantDevice = null;
     }
   }
 }

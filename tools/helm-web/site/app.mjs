@@ -10,10 +10,43 @@ import {
   RecoverySession,
 } from "./modules/recovery-protocol.mjs";
 import { WebSerialTransport } from "./modules/web-serial-transport.mjs";
+import {
+  claimInstallTerminalState,
+  isSelectedRecoveryDisconnect,
+} from "./install-safety.mjs";
 
 const TARGET_DEVICE = "/dev/nvme0n1";
 const SHARED_APX_PRODUCT_ID = 0x7523;
 const MAXIMUM_LOG_LENGTH = 200_000;
+const MAXIMUM_PENDING_TARGET_OUTPUT = 1_000_000;
+const TARGET_LOG_FLUSH_INTERVAL_MS = 100;
+const INSTALL_TIMER_INTERVAL_MS = 1_000;
+const INSTALL_STAGES = Object.freeze([
+  Object.freeze({
+    step: 1,
+    phase: "nvme-install",
+    title: "Install Alpine on NVMe",
+    detail: `Installing Alpine on ${TARGET_DEVICE}. Keep power and USB connected.`,
+  }),
+  Object.freeze({
+    step: 2,
+    phase: "qspi-backup",
+    title: "Back up current QSPI",
+    detail: "Saving the complete current QSPI image to the new NVMe installation.",
+  }),
+  Object.freeze({
+    step: 3,
+    phase: "qspi-write",
+    title: "Write QSPI",
+    detail: "Writing the complete QSPI image. This can take several minutes; do not disconnect power or USB.",
+  }),
+  Object.freeze({
+    step: 4,
+    phase: "qspi-verify",
+    title: "Read back and verify QSPI",
+    detail: "Reading all QSPI back and verifying its SHA-256 checksum.",
+  }),
+]);
 const APPLICATION_BASE_URL = new URL(".", import.meta.url);
 const BUNDLE_NAMES = Object.freeze([
   ...RCM_ARTIFACTS.map(({ name }) => name),
@@ -48,6 +81,11 @@ const elements = Object.freeze({
   progressPercent: requireElement("progress-percent"),
   progressBar: requireElement("progress-bar"),
   progressDetail: requireElement("progress-detail"),
+  installProgress: requireElement("install-progress"),
+  installProgressDevice: requireElement("install-progress-device"),
+  installProgressProfile: requireElement("install-progress-profile"),
+  installStages: requireElement("install-stages"),
+  sessionDetails: requireElement("session-details"),
   sessionLog: requireElement("session-log"),
   logCount: requireElement("log-count"),
 });
@@ -59,6 +97,8 @@ const state = {
   selectedProfile: null,
   preparedBundle: null,
   busy: null,
+  rcm: null,
+  rcmHandoff: null,
   bootComplete: false,
   transport: null,
   recoverySession: null,
@@ -66,9 +106,14 @@ const state = {
   recoveryDisconnected: false,
   installBoundaryCrossed: false,
   installComplete: false,
+  installProgressStep: 0,
+  installStartedAt: null,
+  installTimer: null,
   persistentStateUnknown: false,
   logText: "",
   logEntries: 0,
+  pendingTargetOutput: "",
+  targetOutputTimer: null,
 };
 
 function requireElement(id) {
@@ -126,6 +171,143 @@ function showIndeterminateProgress(title, detail) {
   elements.progressDetail.textContent = detail;
 }
 
+function formatElapsed(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const clock = `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  return hours === 0 ? clock : `${hours.toString().padStart(2, "0")}:${clock}`;
+}
+
+function installElapsed() {
+  if (state.installStartedAt === null) {
+    return "00:00";
+  }
+  return formatElapsed(Date.now() - state.installStartedAt);
+}
+
+function updateInstallElapsed() {
+  if (state.installStartedAt === null) {
+    return;
+  }
+  let stateLabel = "Starting";
+  if (state.installComplete) {
+    stateLabel = "Complete";
+  } else if (state.persistentStateUnknown) {
+    stateLabel = "Stopped";
+  } else if (state.installProgressStep > 0) {
+    stateLabel = `Stage ${state.installProgressStep}/${INSTALL_STAGES.length}`;
+  }
+  elements.progressPercent.textContent = `${stateLabel} · ${installElapsed()} elapsed`;
+}
+
+function stopInstallTimer() {
+  if (state.installTimer !== null) {
+    clearInterval(state.installTimer);
+    state.installTimer = null;
+  }
+  updateInstallElapsed();
+}
+
+function renderInstallStages({ complete = false, failed = false } = {}) {
+  for (const item of elements.installStages.querySelectorAll("[data-install-step]")) {
+    const step = Number.parseInt(item.dataset.installStep ?? "", 10);
+    let itemState = "pending";
+    let label = "Pending";
+    if (complete || step < state.installProgressStep) {
+      itemState = "complete";
+      label = "Done";
+    } else if (step === state.installProgressStep) {
+      itemState = failed ? "failed" : "active";
+      label = failed ? "Stopped" : "Active";
+    }
+    item.dataset.state = itemState;
+    const stateElement = item.querySelector(".install-stage-state");
+    if (stateElement !== null) {
+      stateElement.textContent = label;
+    }
+    if (itemState === "active") {
+      item.setAttribute("aria-current", "step");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+}
+
+function startInstallProgress() {
+  document.body.classList.add("install-active");
+  document.body.classList.remove("install-complete", "install-state-unknown");
+  elements.sessionDetails.open = false;
+  elements.installProgress.hidden = false;
+  elements.installProgressDevice.textContent = state.preflight?.device ?? TARGET_DEVICE;
+  elements.installProgressProfile.textContent = state.preflight?.profile ?? state.selectedProfile?.id ?? "—";
+  state.installProgressStep = 0;
+  state.installStartedAt = Date.now();
+  renderInstallStages();
+  showIndeterminateProgress(
+    "Starting provisioning",
+    "Waiting for the target to confirm the first stage. Persistent writes may be in progress.",
+  );
+  setStatus(
+    "Starting provisioning",
+    "Keep power and recovery USB connected until the target reports completion.",
+    "warning",
+    "Starting",
+  );
+  updateInstallElapsed();
+  stopInstallTimer();
+  state.installTimer = setInterval(updateInstallElapsed, INSTALL_TIMER_INTERVAL_MS);
+}
+
+function handleInstallProgress(marker) {
+  if (state.installComplete || state.persistentStateUnknown) {
+    return;
+  }
+  const stage = INSTALL_STAGES[marker.step - 1];
+  if (
+    marker.kind !== "progress" ||
+    stage === undefined ||
+    marker.phase !== stage.phase ||
+    marker.step <= state.installProgressStep
+  ) {
+    return;
+  }
+  state.installProgressStep = marker.step;
+  renderInstallStages();
+  showIndeterminateProgress(stage.title, stage.detail);
+  setStatus(stage.title, stage.detail, "warning", `Stage ${stage.step}/${INSTALL_STAGES.length}`);
+  updateInstallElapsed();
+  appendLog(`Stage ${stage.step}/${INSTALL_STAGES.length}: ${stage.title}.`, "ok");
+}
+
+function completeInstallProgress(result) {
+  stopInstallTimer();
+  document.body.classList.remove("install-state-unknown");
+  document.body.classList.add("install-complete");
+  renderInstallStages({ complete: true });
+  elements.progressPanel.hidden = false;
+  elements.progressTitle.textContent = "Complete";
+  elements.progressBar.value = 100;
+  elements.progressBar.textContent = "Complete";
+  elements.progressDetail.textContent =
+    `${result.profile} is installed on ${result.device}; QSPI readback verification passed. Safe to power off.`;
+  updateInstallElapsed();
+}
+
+function stopInstallProgress() {
+  stopInstallTimer();
+  document.body.classList.add("install-state-unknown");
+  renderInstallStages({ failed: true });
+  elements.progressPanel.hidden = false;
+  elements.progressTitle.textContent = "Stop — persistent state unknown";
+  elements.progressBar.removeAttribute("value");
+  elements.progressBar.textContent = "Stopped";
+  elements.progressDetail.textContent =
+    "Keep Helm powered and recovery USB connected. Do not retry; inspect recovery first.";
+  updateInstallElapsed();
+}
+
 function formatBytes(value) {
   if (!Number.isFinite(value) || value < 0) {
     return "unknown size";
@@ -176,6 +358,51 @@ function appendLog(message, level = "info") {
   elements.sessionLog.textContent = state.logText;
   elements.sessionLog.scrollTop = elements.sessionLog.scrollHeight;
   elements.logCount.textContent = `${state.logEntries} ${state.logEntries === 1 ? "entry" : "entries"}`;
+}
+
+function compactTargetOutput(output) {
+  const ordinary = [];
+  const progress = new Map();
+  for (const line of output.split(/[\r\n]+/u)) {
+    const clean = line.trim();
+    if (clean.length === 0) {
+      continue;
+    }
+    const match = /^(Erasing blocks|Writing data|Verifying data):/u.exec(clean);
+    if (match !== null) {
+      progress.set(match[1], clean);
+    } else {
+      ordinary.push(clean);
+    }
+  }
+  ordinary.push(...progress.values());
+  return ordinary.join("\n");
+}
+
+function flushTargetOutput() {
+  if (state.targetOutputTimer !== null) {
+    clearTimeout(state.targetOutputTimer);
+    state.targetOutputTimer = null;
+  }
+  const output = state.pendingTargetOutput;
+  state.pendingTargetOutput = "";
+  if (output.length === 0) {
+    return;
+  }
+  const compact = compactTargetOutput(output);
+  if (compact.length > 0) {
+    appendLog(compact, "target");
+  }
+}
+
+function queueTargetOutput(output) {
+  state.pendingTargetOutput += output;
+  if (state.pendingTargetOutput.length > MAXIMUM_PENDING_TARGET_OUTPUT) {
+    state.pendingTargetOutput = state.pendingTargetOutput.slice(-MAXIMUM_PENDING_TARGET_OUTPUT);
+  }
+  if (state.targetOutputTimer === null) {
+    state.targetOutputTimer = setTimeout(flushTargetOutput, TARGET_LOG_FLUSH_INTERVAL_MS);
+  }
 }
 
 function formatError(error) {
@@ -293,6 +520,8 @@ function selectedCatalogProfile() {
 
 function clearPreparedBundle() {
   state.preparedBundle = null;
+  state.rcm = null;
+  state.rcmHandoff = null;
   state.selectedProfile = selectedCatalogProfile();
   setStep("step-prepare", "current", "Ready");
   setStep("step-boot", "locked", "Locked");
@@ -330,6 +559,9 @@ function updateControls() {
   elements.profileSelect.disabled = !state.catalogReady || !idle || state.bootComplete;
   elements.prepareButton.disabled = !supported || !idle || !acknowledged || state.selectedProfile === null || state.preparedBundle !== null || state.bootComplete;
   elements.bootButton.disabled = !supported || !idle || !acknowledged || state.preparedBundle === null || state.bootComplete;
+  elements.bootButton.textContent = state.rcmHandoff === null
+    ? "Select BootROM APX and start"
+    : "Select MB1 APX and continue";
   elements.recoveryButton.disabled = !supported || !idle || !state.bootComplete || state.preflight !== null || state.persistentStateUnknown;
   const exactConfirmation = state.preflight !== null &&
     elements.confirmationInput.value === state.preflight.confirmation;
@@ -484,19 +716,59 @@ async function handleBoot() {
     return;
   }
   const bundle = state.preparedBundle;
+  const continuing = state.rcmHandoff !== null;
+  const rcm = state.rcm ?? new T234WebUsbRcm({ usb: navigator.usb });
+  state.rcm = rcm;
   state.busy = "boot";
-  setStep("step-boot", "working", "Choose APX");
-  setStatus("Choose the matching APX device", "The browser chooser is the physical-device trust boundary.", "working", "USB grant");
-  appendLog(`Requesting APX 0955:${bundle.profile.productId.toString(16).padStart(4, "0")} for ${bundle.profile.board}.`);
+  setStep("step-boot", "working", continuing ? "Choose MB1" : "Choose BootROM");
+  setStatus(
+    continuing ? "Choose the re-enumerated MB1 APX device" : "Choose the BootROM APX device",
+    "Each browser chooser is a physical-device trust boundary.",
+    "working",
+    continuing ? "USB grant 2" : "USB grant 1",
+  );
+  appendLog(
+    `Requesting ${continuing ? "MB1" : "BootROM"} APX ` +
+    `0955:${bundle.profile.productId.toString(16).padStart(4, "0")} for ${bundle.profile.board}.`,
+  );
   updateControls();
-  const rcm = new T234WebUsbRcm({ usb: navigator.usb });
   try {
-    // Keep requestDevice as the first awaited operation in this click handler:
-    // WebUSB permission requires a live, transient user activation.
-    const device = await rcm.requestDevice(bundle);
-    appendLog(`Authorized APX 0955:${device.productId.toString(16).padStart(4, "0")}.`);
-    setStatus("RAM boot in progress", "Keep power and USB connected while APX re-enumerates.", "working", "Transferring");
-    const result = await rcm.boot(device, bundle, { onProgress: handleRcmProgress });
+    if (!continuing) {
+      // Keep requestDevice as the first awaited operation in this click branch:
+      // WebUSB permission requires a live, transient user activation.
+      const device = await rcm.requestDevice(bundle);
+      appendLog(`Authorized BootROM APX 0955:${device.productId.toString(16).padStart(4, "0")}.`);
+      setStatus("BootROM transfer in progress", "Keep power and USB connected while APX re-enumerates.", "working", "Transferring");
+      const handoff = await rcm.bootrom(device, bundle, { onProgress: handleRcmProgress });
+      state.rcmHandoff = handoff;
+      setStep("step-boot", "current", "Second grant");
+      showProgress(
+        "BootROM stage complete",
+        (handoff.bytesSent / bundle.totalBytes) * 100,
+        "Select the re-enumerated MB1/PSC APX device to finish the volatile RAM boot",
+      );
+      setStatus(
+        "BootROM handoff complete",
+        "Click the RAM-boot button again and grant the re-enumerated MB1/PSC APX device.",
+        "success",
+        "Grant 2 needed",
+      );
+      appendLog("BootROM stage 1 complete. Select the re-enumerated MB1/PSC device in a second APX chooser; no persistent writes started.", "ok");
+      return;
+    }
+
+    // This must remain the first awaited operation in the second click branch.
+    const device = await rcm.requestBootloaderDevice(state.rcmHandoff);
+    appendLog(`Authorized MB1 APX 0955:${device.productId.toString(16).padStart(4, "0")}.`);
+    setStatus("RAM boot in progress", "Sending the recovery image through MB1/PSC.", "working", "Transferring");
+    const result = await rcm.bootloader(
+      device,
+      bundle,
+      state.rcmHandoff,
+      { onProgress: handleRcmProgress },
+    );
+    state.rcmHandoff = null;
+    state.rcm = null;
     state.bootComplete = true;
     state.preparedBundle = null;
     setStep("step-boot", "complete", "RAM booted");
@@ -506,10 +778,20 @@ async function handleBoot() {
     appendLog(`RAM boot complete (${formatBytes(result.bytesSent)}). No persistent writes started.`, "ok");
   } catch (error) {
     const cancelled = error instanceof DOMException && error.name === "NotFoundError";
-    setStep("step-boot", "current", cancelled ? "Ready" : "Failed");
+    if (!cancelled) {
+      state.rcmHandoff = null;
+      state.rcm = null;
+    }
+    setStep(
+      "step-boot",
+      "current",
+      cancelled ? (continuing ? "Second grant" : "Ready") : "Restart recovery",
+    );
     setStatus(
-      cancelled ? "APX chooser closed" : "RAM boot did not complete",
-      `${formatError(error)} No persistent writes were started.`,
+      cancelled ? `${continuing ? "MB1" : "BootROM"} chooser closed` : "RAM boot did not complete",
+      `${formatError(error)} ${cancelled && continuing
+        ? "Click again to retry the second grant."
+        : "Re-enter force-recovery before retrying."} No persistent writes were started.`,
       cancelled ? "warning" : "danger",
       cancelled ? "No selection" : "Failed",
     );
@@ -521,6 +803,7 @@ async function handleBoot() {
 }
 
 async function closeRecoveryBestEffort() {
+  flushTargetOutput();
   const transport = state.transport;
   state.transport = null;
   state.recoverySession = null;
@@ -550,14 +833,14 @@ async function handleRecovery() {
   state.busy = "recovery";
   state.recoveryDisconnected = false;
   setStep("step-recovery", "working", "Choose port");
-  setStatus("Choose Helm recovery", "Chrome will request the second and final hardware grant.", "working", "Serial grant");
+  setStatus("Choose Helm recovery", "Chrome will request the third and final hardware grant.", "working", "Serial grant");
   showIndeterminateProgress("Connecting to recovery", "Waiting for authorized Helm recovery 0955:7020");
   appendLog("Requesting recovery serial 0955:7020.");
   updateControls();
   const transport = new WebSerialTransport({
     serial: navigator.serial,
     onOutput(output) {
-      appendLog(output, "target");
+      queueTargetOutput(output);
     },
   });
   state.transport = transport;
@@ -599,10 +882,9 @@ async function handleRecovery() {
 }
 
 function markPersistentStateUnknown(reason) {
-  if (state.installComplete || state.persistentStateUnknown) {
+  if (!claimInstallTerminalState(state, "unknown")) {
     return;
   }
-  state.persistentStateUnknown = true;
   setStep("step-install", "failed", "State unknown");
   setStatus(
     "Persistent state is unknown",
@@ -610,7 +892,7 @@ function markPersistentStateUnknown(reason) {
     "danger",
     "Do not retry",
   );
-  showIndeterminateProgress("Manual recovery required", "Keep power connected; do not assume NVMe or QSPI is complete");
+  stopInstallProgress();
   appendLog(`${reason} Persistent state is unknown; keep Helm powered and do not retry blindly.`, "fatal");
   updateControls();
 }
@@ -631,16 +913,25 @@ async function handleInstall() {
   // may receive enough of the command to begin persistent storage writes.
   state.installBoundaryCrossed = true;
   setStep("step-install", "working", "Writing");
-  setStatus("Erasing NVMe and flashing QSPI", "Do not disconnect USB or power. Persistent writes are in progress.", "warning", "Writing");
-  showIndeterminateProgress("Provisioning persistent storage", "Target output is visible in the session log; this can take several minutes");
+  startInstallProgress();
   appendLog("EXACT CONFIRMATION ACCEPTED. Persistent provisioning command is being sent.", "write");
   updateControls();
   try {
-    const result = await state.recoverySession.install(typedConfirmation);
-    state.installComplete = true;
+    const result = await state.recoverySession.install(typedConfirmation, {
+      onProgress: handleInstallProgress,
+    });
+    if (!claimInstallTerminalState(state, "complete")) {
+      await closeRecoveryBestEffort();
+      return;
+    }
     setStep("step-install", "complete", "Complete");
-    showProgress("Helm provisioning complete", 100, `${result.profile} installed on ${result.device}; target returned the session-bound success marker`);
-    setStatus("Helm is provisioned", "The target reported a clean final success marker. It is safe to follow the documented reboot procedure.", "success", "Complete");
+    completeInstallProgress(result);
+    setStatus(
+      "Helm is provisioned",
+      "The target returned a clean session-bound success marker. It is safe to power off, release force recovery, and cold boot.",
+      "success",
+      "Complete",
+    );
     appendLog(`Provisioning succeeded for ${result.profile} on ${result.device}.`, "ok");
     await closeRecoveryBestEffort();
   } catch (error) {
@@ -654,8 +945,8 @@ async function handleInstall() {
   }
 }
 
-function handleSerialDisconnect() {
-  if (state.transport === null || state.installComplete) {
+function handleSerialDisconnect(event) {
+  if (!isSelectedRecoveryDisconnect(state.transport, event) || state.installComplete) {
     return;
   }
   state.recoveryDisconnected = true;

@@ -6,6 +6,13 @@ const INVENTORY_PATTERN = /^[0-9a-f]{64}$/;
 const SUCCESS_PATTERN = /^HELM_PROVISION_SUCCESS session=([0-9a-f]{32}) profile=([^ ]+) device=([^ ]+)$/;
 const FAILURE_PATTERN = /^HELM_PROVISION_FAILURE session=([0-9a-f]{32}) rc=([0-9]+)$/;
 const PREFLIGHT_PATTERN = /^HELM_PROVISION_PREFLIGHT_SUCCESS session=([0-9a-f]{32}) profile=([^ ]+) device=([^ ]+) inventory=([0-9a-f]{64})$/;
+const PROGRESS_PATTERN = /^HELM_PROVISION_PROGRESS session=([0-9a-f]{32}) step=([1-4]) phase=(nvme-install|qspi-backup|qspi-write|qspi-verify)$/;
+const PROGRESS_PHASES = Object.freeze([
+  "nvme-install",
+  "qspi-backup",
+  "qspi-write",
+  "qspi-verify",
+]);
 
 export const RECOVERY_USB_VENDOR_ID = 0x0955;
 export const RECOVERY_USB_PRODUCT_ID = 0x7020;
@@ -73,6 +80,20 @@ export function parseMarker(line) {
       kind: "failure",
       session: match[1],
       returncode: Number.parseInt(match[2], 10),
+    };
+  }
+  match = PROGRESS_PATTERN.exec(line);
+  if (match) {
+    const step = Number.parseInt(match[2], 10);
+    const phase = match[3];
+    if (PROGRESS_PHASES[step - 1] !== phase) {
+      return null;
+    }
+    return {
+      kind: "progress",
+      session: match[1],
+      step,
+      phase,
     };
   }
   return null;
@@ -232,7 +253,11 @@ export class RecoverySession {
     const markerLine = await writeAndWaitForLine(
       this.#transport,
       preflightCommand(profile, device, token),
-      (line) => parseMarker(line)?.session === token,
+      (line) => {
+        const marker = parseMarker(line);
+        return marker?.session === token &&
+          (marker.kind === "preflight-success" || marker.kind === "failure");
+      },
       timeoutMs,
     );
     const marker = parseMarker(markerLine);
@@ -249,7 +274,7 @@ export class RecoverySession {
     return this.#preflight;
   }
 
-  async install(typedConfirmation, { timeoutMs = 1_800_000 } = {}) {
+  async install(typedConfirmation, { timeoutMs = 1_800_000, onProgress = null } = {}) {
     if (this.#preflight === null) {
       throw new RecoveryProtocolError("read-only preflight must pass before install");
     }
@@ -263,14 +288,36 @@ export class RecoverySession {
     const { profile, device, inventory } = this.#preflight;
     const token = this.#nextToken();
     validateRequest(profile, device, token);
+    if (onProgress !== null && typeof onProgress !== "function") {
+      throw new TypeError("onProgress must be a function");
+    }
     this.#installAttempted = true;
+    let lastProgressStep = 0;
     try {
       // Once this write is attempted the browser cannot prove whether the
       // target shell received enough of the command to begin persistent I/O.
       const markerLine = await writeAndWaitForLine(
         this.#transport,
         installCommand(profile, device, token, inventory),
-        (line) => parseMarker(line)?.session === token,
+        (line) => {
+          const marker = parseMarker(line);
+          if (marker?.session !== token) {
+            return false;
+          }
+          if (marker.kind === "progress") {
+            if (marker.step > lastProgressStep) {
+              lastProgressStep = marker.step;
+              try {
+                onProgress?.(marker);
+              } catch {
+                // Progress rendering is advisory. It must never interrupt the
+                // authoritative session-bound final marker wait.
+              }
+            }
+            return false;
+          }
+          return marker.kind === "success" || marker.kind === "failure";
+        },
         timeoutMs,
       );
       const marker = parseMarker(markerLine);

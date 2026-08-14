@@ -63,6 +63,42 @@
           aria-describedby="progress-detail"
         >0%</progress>
         <p id="progress-detail"></p>
+
+        <div id="install-progress" class="install-progress" hidden>
+          <dl class="install-target">
+            <div>
+              <dt>Device</dt>
+              <dd id="install-progress-device">—</dd>
+            </div>
+            <div>
+              <dt>Profile</dt>
+              <dd id="install-progress-profile">—</dd>
+            </div>
+          </dl>
+
+          <ol id="install-stages" class="install-stages" aria-label="Provisioning stages">
+            <li data-install-step="1" data-install-phase="nvme-install" data-state="pending">
+              <span class="install-stage-number" aria-hidden="true">1</span>
+              <span class="install-stage-name">Install Alpine on NVMe</span>
+              <span class="install-stage-state">Pending</span>
+            </li>
+            <li data-install-step="2" data-install-phase="qspi-backup" data-state="pending">
+              <span class="install-stage-number" aria-hidden="true">2</span>
+              <span class="install-stage-name">Back up current QSPI</span>
+              <span class="install-stage-state">Pending</span>
+            </li>
+            <li data-install-step="3" data-install-phase="qspi-write" data-state="pending">
+              <span class="install-stage-number" aria-hidden="true">3</span>
+              <span class="install-stage-name">Write QSPI</span>
+              <span class="install-stage-state">Pending</span>
+            </li>
+            <li data-install-step="4" data-install-phase="qspi-verify" data-state="pending">
+              <span class="install-stage-number" aria-hidden="true">4</span>
+              <span class="install-stage-name">Read back and verify QSPI</span>
+              <span class="install-stage-state">Pending</span>
+            </li>
+          </ol>
+        </div>
       </section>
 
       <label class="hardware-gate">
@@ -110,12 +146,12 @@
             </div>
             <span class="step-state">Locked</span>
           </div>
-          <p class="step-copy">Select the matching NVIDIA APX device. This stage does not write NVMe or QSPI.</p>
+          <p class="step-copy">Grant BootROM, then grant MB1/PSC after APX re-enumerates. This does not write NVMe or QSPI.</p>
           <div class="action-row">
             <button id="boot-button" class="button button-primary" type="button" disabled>
-              Select APX and boot
+              Select BootROM APX and start
             </button>
-            <span class="action-hint">Browser permission 1 of 2</span>
+            <span class="action-hint">APX permissions 1 and 2 of 3</span>
           </div>
         </li>
 
@@ -132,7 +168,7 @@
             <button id="recovery-button" class="button button-primary" type="button" disabled>
               Connect and preflight
             </button>
-            <span class="action-hint">Browser permission 2 of 2</span>
+            <span class="action-hint">Recovery permission 3 of 3</span>
           </div>
         </li>
 
@@ -184,7 +220,7 @@
         </li>
       </ol>
 
-      <details class="console">
+      <details id="session-details" class="console">
         <summary>
           <span>Session log</span>
           <span id="log-count">0 entries</span>

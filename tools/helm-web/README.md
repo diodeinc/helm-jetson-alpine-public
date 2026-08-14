@@ -33,13 +33,15 @@ and USB/serial Permissions Policy.
 The customer flow is deliberately split into four visible stages:
 
 1. Select the exact module, download its bundle, and verify every digest.
-2. Grant APX WebUSB access and perform the volatile RAM boot.
+2. Grant BootROM APX access, then grant the re-enumerated MB1/PSC APX device
+   and complete the volatile RAM boot.
 3. Grant the re-enumerated `0955:7020` recovery console through Web Serial and
    run the target-side read-only preflight.
 4. Review the NVMe inventory fingerprint, type the exact generated phrase,
    and explicitly start the persistent NVMe/QSPI operation.
 
-It is one physical cable but two browser permission grants. Nothing starts the
+It is one physical cable but three browser permission grants: BootROM WebUSB,
+MB1/PSC WebUSB, then recovery Web Serial. Nothing starts the
 installer automatically. A timeout or disconnect after the install command is
 sent is reported as unknown persistent state, never as success.
 
@@ -60,6 +62,8 @@ import {
 } from "./tools/helm-web/index.js";
 
 let bundle;
+let rcm;
+let handoff;
 
 bundleInput.addEventListener("change", async () => {
   bundle = await validateRcmBundle(bundleInput.files, {
@@ -72,9 +76,17 @@ bundleInput.addEventListener("change", async () => {
 });
 
 bootButton.addEventListener("click", async () => {
-  const rcm = new T234WebUsbRcm();
+  rcm = new T234WebUsbRcm();
   const device = await rcm.requestDevice(bundle);
-  const result = await rcm.boot(device, bundle, {
+  handoff = await rcm.bootrom(device, bundle, {
+    onProgress: showUsbProgress,
+  });
+});
+
+continueButton.addEventListener("click", async () => {
+  // Keep the chooser as the first awaited operation in this second click.
+  const device = await rcm.requestBootloaderDevice(handoff);
+  const result = await rcm.bootloader(device, bundle, handoff, {
     onProgress: showUsbProgress,
   });
   console.log(result.cid, result.banner);
@@ -131,11 +143,13 @@ The implementation mirrors
    - `mb1_t234_prod_aligned_sigheader.bin.encrypt`
    - `psc_bl1_t234_prod_aligned_sigheader.bin.encrypt`
    - `mb1_bct_MB1_sigheader.bct.encrypt`
-4. Close the handle and wait at most 30 seconds for exactly one authorized
-   matching APX device to re-enumerate.
-5. Claim it, read exactly `0x44` bytes from bulk IN, and parse the 64-byte
+4. Close the handle and pause. T234 has no USB serial number, so Chromium may
+   revoke the BootROM grant when the device re-enumerates.
+5. From a second customer click, request exactly `0955:<profile PID>` again
+   and select the re-enumerated MB1/PSC APX device.
+6. Claim it, read exactly `0x44` bytes from bulk IN, and parse the 64-byte
    version followed by the little-endian last-boot-error value.
-6. Close and reopen it, then send `mem_rcm_sigheader.bct.encrypt` and
+7. Close and reopen it, then send `mem_rcm_sigheader.bct.encrypt` and
    `blob.bin` raw to bulk OUT in that order.
 
 No length prefix, command record, or per-image wire wrapper is added. Partial
@@ -162,17 +176,19 @@ authority before any persistent QSPI write.
 
 ## Remaining browser boundary
 
-WebUSB does not expose a stable physical-port path. The first device is chosen
-by the customer through the browser picker and checked against the origin's
-authorized devices before the CID is consumed. After BootROM handoff, a USB
-serial binds the re-enumerated device when one is available. Without a serial,
-the selected device must be the only authorized VID/PID match and the browser
-must report an actual disconnect before any new object is accepted. Multiple
-candidates fail closed. Browsers normally discard a serialless device grant on
-disconnect, so that conservative path may time out instead of switching
-boards. Whether Chromium carries permission and a stable serial across the
-real T234 BootROM-to-MB1 re-enumeration must be qualified on each supported
-browser/platform combination.
+WebUSB does not expose a stable physical-port path. T234 also advertises
+`iSerialNumber=0`; manually reading descriptor 3 for the CID does not turn it
+into a WebUSB serial. Chromium therefore revokes the ephemeral BootROM grant
+when APX disconnects and normally requires a second customer chooser gesture
+for the MB1/PSC stage. The code always requires that fresh chooser action, but
+does not use JavaScript object identity as a handoff signal: Chromium/macOS can
+reuse the same `USBDevice` wrapper when the underlying APX transport changes.
+Instead, it requires the exact 68-byte MB1/PSC banner before either remaining
+artifact is sent. A stale BootROM only times out and receives no stage-two
+payload. WebUSB still exposes neither a stable serial nor a port path here, so
+the exactly-one-board acknowledgment and the operator's second chooser
+selection remain the physical binding. Multiple authorized exact-PID matches
+fail closed.
 
 The included `web-serial-transport.mjs`, `recovery-protocol.mjs`, and static
 application implement the post-RCM phase. They retain distinct random tokens
@@ -180,6 +196,13 @@ for readiness, preflight, and install; bind the full target inventory hash;
 and accept only the requested final session marker. The browser never replaces
 the module EEPROM, NVMe geometry, payload, QSPI backup, or full-readback guards
 inside recovery.
+
+After the destructive boundary, the page reduces to the selected device and
+profile, four session-bound target stages, elapsed time, and a collapsed raw
+log. The stages are NVMe install, QSPI backup, QSPI write, and full QSPI
+readback verification. They are deliberately indeterminate: elapsed time is
+not presented as device progress, and only the validated final success marker
+may change the result to complete.
 
 Web Serial exposes only the USB VID/PID, not the product, serial, or macOS
 physical `locationID` used by the native guided CLI. The browser application
@@ -201,11 +224,11 @@ tools/helm-web/prepare-site.py self-test
 ```
 
 The suite covers profile/PID binding, strict manifests, incremental hashing,
-exact device filters, partial transfers, the complete six-file wire order,
+exact device filters, the serialless two-grant handoff, partial transfers, the complete six-file wire order,
 the 68-byte banner, progress, duplicate-device rejection, timeout cleanup,
 token-bound recovery markers, exact confirmation, unknown-state handling,
 static path confinement, headers, HEAD requests, and bounded byte ranges.
 
 The WebUSB protocol and generated bundles are source- and simulation-verified.
-The BootROM-to-MB1 permission handoff still needs physical qualification in
-desktop Chrome on every supported host/platform combination.
+The two-grant BootROM-to-MB1 flow still needs physical qualification in desktop
+Chrome on every supported host/platform combination.

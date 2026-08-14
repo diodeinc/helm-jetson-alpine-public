@@ -32,6 +32,10 @@ class LineFramer {
     }
     return lines;
   }
+
+  reset() {
+    this.#buffer = "";
+  }
 }
 
 export class WebSerialTransport {
@@ -92,7 +96,9 @@ export class WebSerialTransport {
         stopBits: 1,
         parity: "none",
         flowControl: "none",
-        bufferSize: 65_536,
+        // Leave enough host-side slack for bootloader/install diagnostics even
+        // if rendering the visible session log briefly stalls the main thread.
+        bufferSize: 1_048_576,
       });
       if (port.readable === null || port.writable === null) {
         throw new RecoveryProtocolError("Helm recovery serial streams are unavailable");
@@ -113,22 +119,72 @@ export class WebSerialTransport {
 
   async #pump() {
     try {
-      while (!this.#closed) {
-        const { value, done } = await this.#reader.read();
-        if (done) {
-          if (!this.#closed) {
-            throw new RecoveryProtocolError("recovery console disconnected");
+      while (!this.#closed && this.#port !== null && this.#port.readable !== null) {
+        const readable = this.#port.readable;
+        const reader = this.#reader ?? readable.getReader();
+        this.#reader = reader;
+        let readFailure = null;
+        let streamEnded = false;
+        try {
+          while (!this.#closed) {
+            let result;
+            try {
+              result = await reader.read();
+            } catch (error) {
+              readFailure = error;
+              break;
+            }
+            if (result.done) {
+              streamEnded = true;
+              break;
+            }
+            const text = this.#decoder.decode(result.value, { stream: true });
+            for (const line of this.#framer.push(text)) {
+              this.#dispatch(line);
+            }
+            try {
+              this.#onOutput(text);
+            } catch {
+              // Visible logging is nonessential. It must never stop the protocol
+              // reader or a persistent operation already running on the target.
+            }
           }
+        } finally {
+          if (this.#reader === reader) {
+            this.#reader = null;
+          }
+          reader.releaseLock();
+        }
+
+        if (this.#closed) {
           break;
         }
-        const text = this.#decoder.decode(value, { stream: true });
-        this.#onOutput(text);
-        for (const line of this.#framer.push(text)) {
-          this.#dispatch(line);
+        if (readFailure !== null) {
+          // Chrome replaces port.readable after recoverable serial conditions
+          // such as buffer overrun, framing, or parity errors. Keep existing
+          // marker waiters alive and attach a reader to that replacement.
+          const replacement = this.#port?.readable ?? null;
+          if (replacement !== null && replacement !== readable) {
+            // Bytes may have been lost at the serial error boundary. Discard
+            // any partial UTF-8 sequence or unterminated line from the failed
+            // stream so it cannot corrupt a marker on the replacement.
+            this.#decoder = new TextDecoder("utf-8", { fatal: false });
+            this.#framer.reset();
+            continue;
+          }
+          throw readFailure;
+        }
+        if (streamEnded) {
+          throw new RecoveryProtocolError("recovery console disconnected");
         }
       }
+      if (!this.#closed) {
+        throw new RecoveryProtocolError("recovery console disconnected");
+      }
     } catch (error) {
-      this.#failWaiters(error);
+      if (!this.#closed) {
+        this.#failWaiters(error);
+      }
     }
   }
 
@@ -207,6 +263,10 @@ export class WebSerialTransport {
     });
   }
 
+  ownsPort(port) {
+    return this.#port !== null && port === this.#port;
+  }
+
   async writeAscii(text) {
     if (this.#writer === null || this.#closed) {
       throw new RecoveryProtocolError("recovery serial transport is not open");
@@ -234,7 +294,6 @@ export class WebSerialTransport {
     } catch {
       // The port may already have disconnected.
     }
-    this.#reader?.releaseLock();
     this.#writer?.releaseLock();
     this.#reader = null;
     this.#writer = null;

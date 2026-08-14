@@ -155,9 +155,18 @@ and the image checksum. NVIDIA's separate 64 KiB QSPI layout stride remains in
 the catalog for partition placement and BCT redundancy; it is not the
 kernel-reported erase unit. The installer requires an unused backup path on a
 mounted block filesystem, backs up the complete device, uses `flashcp` (which
-reads the live MTD geometry), and verifies a full readback. Its catalogs are
-structurally verified for all five module SKUs; P3767-0001 has also passed
-physical QSPI write/readback, NVMe installation, and cold boot on Helm.
+reads the live MTD geometry) without verbose per-erase-unit progress that would
+flood the recovery CDC channel, and verifies a full SHA-256 readback. Its
+catalogs are structurally verified for all five module SKUs; P3767-0001 has
+also passed physical QSPI write/readback, NVMe installation, and cold boot on
+Helm.
+
+Guided provisioning emits four bounded, session-token-bound progress markers:
+NVMe install, QSPI backup, QSPI write, and QSPI readback verification. The
+internal `--progress-session` QSPI option accepts exactly 32 lowercase
+hexadecimal characters and is passed only by `helm-provision`; standalone
+`helm-qspi-install` runs emit no machine progress markers. Final success and
+failure markers remain authoritative.
 
 ## First boot
 

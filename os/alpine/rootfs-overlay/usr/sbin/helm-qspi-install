@@ -15,6 +15,8 @@ image=/opt/helm/payload/helm-qspi.img
 checksum=/opt/helm/payload/helm-qspi.img.sha256
 backup=
 confirm=
+progress_session=
+progress_session_seen=0
 expected_size=67108864
 # NVIDIA's QSPI layout and BCT redundancy use a 64 KiB stride, but that is
 # not Linux's MTD erase geometry. The pinned R39 kernel enables
@@ -33,7 +35,7 @@ usage()
 usage:
   $program inspect [--device /dev/mtd0]
   $program install --device /dev/mtd0 --backup /mounted/path/qspi-before.img \\
-    --confirm $profile
+    --confirm $profile [--progress-session 32_LOWERCASE_HEX_CHARACTERS]
   $program self-test
 
 install erases and rewrites the complete 64 MiB QSPI. It requires a backup on
@@ -78,6 +80,39 @@ mtd_geometry_supported()
 	[ "$1:$2" = "$expected_size:$expected_mtd_erase_size" ]
 }
 
+progress_session_supported()
+{
+	[ "${#1}" -eq 32 ] || return 1
+	case "$1" in
+		*[!0-9a-f]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+emit_qspi_progress()
+{
+	progress_step=$1
+	case "$progress_step" in
+		2) progress_phase=qspi-backup ;;
+		3) progress_phase=qspi-write ;;
+		4) progress_phase=qspi-verify ;;
+		*) die "invalid internal QSPI progress step: $progress_step" ;;
+	esac
+	[ "$progress_session_seen" -eq 1 ] || return 0
+	progress_session_supported "$progress_session" || \
+		die "internal progress session is not 32 lowercase hexadecimal characters"
+	printf 'HELM_PROVISION_PROGRESS session=%s step=%s phase=%s\n' \
+		"$progress_session" "$progress_step" "$progress_phase"
+}
+
+write_qspi_image()
+{
+	# flashcp -v reports progress at the live 4 KiB erase granularity. Keep the
+	# recovery CDC channel bounded; the full-device SHA-256 readback below is the
+	# authoritative completion check.
+	flashcp "$1" "$2"
+}
+
 self_test()
 {
 	profile_identity_supported helm-orin-nx-16gb-r39.2 3767 0000 0x7323
@@ -92,7 +127,38 @@ self_test()
 	! mtd_geometry_supported 67108864 65536
 	! mtd_geometry_supported 33554432 4096
 	! mtd_geometry_supported 67108864 invalid
-	printf '%s: profile, EEPROM, and MTD geometry guards passed\n' "$program"
+	progress_session_supported 0123456789abcdef0123456789abcdef
+	! progress_session_supported 0123456789ABCDEF0123456789ABCDEF
+	! progress_session_supported 0123456789abcdef
+	progress_session_seen=0
+	[ -z "$(emit_qspi_progress 2)" ]
+	progress_session=0123456789abcdef0123456789abcdef
+	progress_session_seen=1
+	[ "$(emit_qspi_progress 2)" = \
+		"HELM_PROVISION_PROGRESS session=$progress_session step=2 phase=qspi-backup" ]
+	[ "$(emit_qspi_progress 3)" = \
+		"HELM_PROVISION_PROGRESS session=$progress_session step=3 phase=qspi-write" ]
+	[ "$(emit_qspi_progress 4)" = \
+		"HELM_PROVISION_PROGRESS session=$progress_session step=4 phase=qspi-verify" ]
+	if (
+		progress_session=invalid
+		emit_qspi_progress 2
+	) >/dev/null 2>&1
+	then
+		return 1
+	fi
+	if (emit_qspi_progress 1) >/dev/null 2>&1; then
+		return 1
+	fi
+	flashcp()
+	{
+		[ "$#" -eq 2 ] &&
+			[ "$1" = mock-qspi-image ] &&
+			[ "$2" = mock-mtd-device ]
+	}
+	write_qspi_image mock-qspi-image mock-mtd-device
+	printf '%s: profile, EEPROM, MTD geometry, progress, and quiet flash guards passed\n' \
+		"$program"
 }
 
 load_profile()
@@ -198,6 +264,14 @@ while [ "$#" -gt 0 ]; do
 			confirm=$2
 			shift 2
 			;;
+		--progress-session)
+			[ "$#" -ge 2 ] || die "--progress-session needs a value"
+			[ "$progress_session_seen" -eq 0 ] || \
+				die "--progress-session may be specified only once"
+			progress_session=$2
+			progress_session_seen=1
+			shift 2
+			;;
 		-h|--help)
 			usage
 			exit 0
@@ -210,6 +284,8 @@ case "$command_name" in
 	inspect)
 		[ -z "$backup" ] || die "--backup is invalid with inspect"
 		[ -z "$confirm" ] || die "--confirm is invalid with inspect"
+		[ "$progress_session_seen" -eq 0 ] || \
+			die "--progress-session is invalid with inspect"
 		load_profile
 		validate_module
 		device=$(canonical_mtd "$device")
@@ -223,7 +299,9 @@ case "$command_name" in
 		;;
 	install) ;;
 	self-test)
-		[ "$#" -eq 0 ] || die "self-test takes no arguments"
+		[ "$device_set$progress_session_seen" = 00 ] || \
+			die "self-test takes no arguments"
+		[ -z "$backup$confirm" ] || die "self-test takes no arguments"
 		self_test
 		exit 0
 		;;
@@ -236,6 +314,10 @@ esac
 
 [ "$(id -u)" -eq 0 ] || die "install must run as root"
 [ "$command_name" = install ] || die "internal command dispatch error"
+if [ "$progress_session_seen" -eq 1 ]; then
+	progress_session_supported "$progress_session" || \
+		die "--progress-session must be exactly 32 lowercase hexadecimal characters"
+fi
 load_profile
 validate_module
 [ "$device_set" -eq 1 ] || die "install requires --device"
@@ -276,6 +358,7 @@ geometry
 printf 'image SHA:  %s\n' "$actual_sha"
 printf '\nBacking up all QSPI to %s before destructive write...\n' "$backup"
 umask 077
+emit_qspi_progress 2
 dd if="$device" of="$backup" bs=1048576 count=64 conv=fsync
 backup_size=$(wc -c < "$backup" | tr -d ' ')
 [ "$backup_size" -eq "$expected_size" ] || die "QSPI backup is incomplete"
@@ -284,7 +367,9 @@ printf '%s  %s\n' "$backup_sha" "${backup##*/}" > "$backup.sha256"
 sync
 
 printf '\nERASING AND WRITING COMPLETE QSPI. DO NOT REMOVE POWER.\n'
-flashcp -v "$image" "$device"
+emit_qspi_progress 3
+write_qspi_image "$image" "$device"
+emit_qspi_progress 4
 readback_sha=$(dd if="$device" bs=1048576 count=64 2>/dev/null | \
 	sha256sum | awk '{ print $1 }')
 [ "$readback_sha" = "$actual_sha" ] || die "full QSPI readback checksum mismatch"

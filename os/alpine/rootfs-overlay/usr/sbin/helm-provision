@@ -89,6 +89,14 @@ session_supported()
 	esac
 }
 
+emit_nvme_progress()
+{
+	session_supported "$session" || \
+		die "internal progress session is not 32 lowercase hexadecimal characters"
+	printf 'HELM_PROVISION_PROGRESS session=%s step=1 phase=nvme-install\n' \
+		"$session"
+}
+
 inventory_supported()
 {
 	[ "${#1}" -eq 64 ] || return 1
@@ -209,6 +217,16 @@ self_test()
 	session_supported 0123456789abcdef0123456789abcdef
 	! session_supported 0123456789ABCDEF0123456789ABCDEF
 	! session_supported 0123456789abcdef
+	session=0123456789abcdef0123456789abcdef
+	[ "$(emit_nvme_progress)" = \
+		"HELM_PROVISION_PROGRESS session=$session step=1 phase=nvme-install" ]
+	if (
+		session=invalid
+		emit_nvme_progress
+	) >/dev/null 2>&1
+	then
+		return 1
+	fi
 	inventory_supported \
 		0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 	! inventory_supported 0123456789abcdef
@@ -238,7 +256,7 @@ self_test()
 		! persistent_backup_path_allowed "$forbidden_backup"
 	done
 	! persistent_backup_path_allowed relative/qspi-before.img
-	printf '%s: confirmation guards passed\n' "$program"
+	printf '%s: confirmation and progress guards passed\n' "$program"
 }
 
 command_name=${1:-}
@@ -366,6 +384,7 @@ then
 	die "NVMe inventory changed after confirmation; refusing persistent writes"
 fi
 
+emit_nvme_progress
 printf 'HELM_PROVISION_STAGE nvme-install device=%s\n' "$device"
 helm-install install --device "$device" --confirm "$confirm_device"
 
@@ -389,7 +408,8 @@ root_mounted=1
 printf 'HELM_PROVISION_STAGE qspi-install backup=%s\n' \
 	"$root_partition:/root/qspi-before.img"
 helm-qspi-install install --device /dev/mtd0 \
-	--backup "$backup" --confirm "$confirm_profile"
+	--backup "$backup" --confirm "$confirm_profile" \
+	--progress-session "$session"
 
 sync
 umount "$mount_dir"

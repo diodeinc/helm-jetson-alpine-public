@@ -14,6 +14,10 @@ import {
   randomSessionToken,
 } from "./recovery-protocol.mjs";
 import { WebSerialTransport } from "./web-serial-transport.mjs";
+import {
+  claimInstallTerminalState,
+  isSelectedRecoveryDisconnect,
+} from "./site/install-safety.mjs";
 
 const PROFILE = "helm-orin-nx-8gb-r39.2";
 const DEVICE = "/dev/nvme0n1";
@@ -44,6 +48,38 @@ test("protocol accepts only complete token-bound marker lines", () => {
   assert.equal(
     parseMarker(
       `HELM_PROVISION_SUCCESS session=${PREFLIGHT_TOKEN} profile=${PROFILE} device=${DEVICE}\nextra`,
+    ),
+    null,
+  );
+  const phases = ["nvme-install", "qspi-backup", "qspi-write", "qspi-verify"];
+  phases.forEach((phase, index) => {
+    assert.deepEqual(
+      parseMarker(
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=${index + 1} phase=${phase}`,
+      ),
+      {
+        kind: "progress",
+        session: INSTALL_TOKEN,
+        step: index + 1,
+        phase,
+      },
+    );
+  });
+  assert.equal(
+    parseMarker(
+      `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=2 phase=qspi-write`,
+    ),
+    null,
+  );
+  assert.equal(
+    parseMarker(
+      `printf 'HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=1 phase=nvme-install'`,
+    ),
+    null,
+  );
+  assert.equal(
+    parseMarker(
+      `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=1 phase=nvme-install\nextra`,
     ),
     null,
   );
@@ -120,6 +156,17 @@ class FakePort {
   emit(text) {
     this.controller.enqueue(new TextEncoder().encode(text));
   }
+
+  replaceReadableAfterError(error) {
+    const failedController = this.controller;
+    this.readable = new ReadableStream({
+      start: (controller) => {
+        this.controller = controller;
+      },
+      cancel: () => {},
+    });
+    failedController.error(error);
+  }
 }
 
 function fakeSerialFor(port) {
@@ -142,6 +189,7 @@ test("Web Serial transport filters and verifies Helm recovery identity", async (
     filters: [{ usbVendorId: 0x0955, usbProductId: 0x7020 }],
   });
   assert.equal(port.openOptions.baudRate, 115_200);
+  assert.equal(port.openOptions.bufferSize, 1_048_576);
   const line = transport.waitForLine((candidate) => candidate === "target ready", {
     timeoutMs: 1_000,
   });
@@ -153,10 +201,106 @@ test("Web Serial transport filters and verifies Helm recovery identity", async (
   assert.equal(port.closed, true);
 });
 
+test("serial disconnect filtering accepts only the selected recovery port", async () => {
+  const selectedPort = new FakePort(async () => {});
+  const unrelatedPort = new FakePort(async () => {});
+  const transport = new WebSerialTransport({ serial: fakeSerialFor(selectedPort) });
+  await transport.requestAndOpen();
+
+  assert.equal(
+    isSelectedRecoveryDisconnect(transport, { target: unrelatedPort }),
+    false,
+  );
+  assert.equal(
+    isSelectedRecoveryDisconnect(transport, { target: selectedPort }),
+    true,
+  );
+
+  await transport.close();
+  assert.equal(
+    isSelectedRecoveryDisconnect(transport, { target: selectedPort }),
+    false,
+  );
+});
+
+test("post-write unknown state cannot race into completion", () => {
+  const disconnectFirst = {
+    installComplete: false,
+    persistentStateUnknown: false,
+  };
+  assert.equal(claimInstallTerminalState(disconnectFirst, "unknown"), true);
+  assert.equal(claimInstallTerminalState(disconnectFirst, "complete"), false);
+  assert.deepEqual(disconnectFirst, {
+    installComplete: false,
+    persistentStateUnknown: true,
+  });
+
+  const successFirst = {
+    installComplete: false,
+    persistentStateUnknown: false,
+  };
+  assert.equal(claimInstallTerminalState(successFirst, "complete"), true);
+  assert.equal(claimInstallTerminalState(successFirst, "unknown"), false);
+  assert.deepEqual(successFirst, {
+    installComplete: true,
+    persistentStateUnknown: false,
+  });
+});
+
 test("Web Serial transport rejects a mismatched chooser result", async () => {
   const port = new FakePort(async () => {}, { usbVendorId: 0x0955, usbProductId: 0x7423 });
   const transport = new WebSerialTransport({ serial: fakeSerialFor(port) });
   await assert.rejects(() => transport.requestAndOpen(), /not Helm recovery/);
+});
+
+test("a failing visible-output callback cannot stop protocol markers", async () => {
+  const port = new FakePort(async () => {});
+  const transport = new WebSerialTransport({
+    serial: fakeSerialFor(port),
+    onOutput() {
+      throw new Error("rendering failed");
+    },
+  });
+  await transport.requestAndOpen();
+  const line = transport.waitForLine((candidate) => candidate === "still alive", {
+    timeoutMs: 1_000,
+  });
+  port.emit("still alive\r\n");
+  assert.equal(await line, "still alive");
+  await transport.close();
+});
+
+test("Web Serial recovers a token-bound marker from a replacement readable stream", async () => {
+  const port = new FakePort(async () => {});
+  const originalReadable = port.readable;
+  let prefixSeenResolve;
+  const prefixSeen = new Promise((resolve) => {
+    prefixSeenResolve = resolve;
+  });
+  const transport = new WebSerialTransport({
+    serial: fakeSerialFor(port),
+    onOutput(text) {
+      if (text === "unterminated prefix") {
+        prefixSeenResolve();
+      }
+    },
+  });
+  await transport.requestAndOpen();
+
+  const marker = `HELM_PROVISION_READY session=${READY_TOKEN}`;
+  const line = transport.waitForLine((candidate) => candidate === marker, {
+    timeoutMs: 1_000,
+  });
+  port.emit("unterminated prefix");
+  await prefixSeen;
+  port.replaceReadableAfterError(new Error("recoverable serial framing error"));
+  port.emit(`${marker}\r\n`);
+
+  assert.equal(await line, marker);
+  assert.equal(originalReadable.locked, false);
+  await transport.close();
+  assert.equal(port.readable.locked, false);
+  assert.equal(port.closed, true);
 });
 
 test("Web Serial marker waiters can be cancelled without a later timeout", async () => {
@@ -209,6 +353,69 @@ test("guided Web Serial flow preflights before exact confirmation and install", 
     device: DEVICE,
   });
   assert.match(port.writes.at(-1), new RegExp(`--confirm-inventory ${INVENTORY}`));
+  await transport.close();
+});
+
+test("install progress is token-bound, monotonic, and never completes the install", async () => {
+  const staleToken = "3".repeat(32);
+  let installPort;
+  let fourthProgressResolve;
+  const fourthProgress = new Promise((resolve) => {
+    fourthProgressResolve = resolve;
+  });
+  const port = new FakePort(async (command, target) => {
+    if (command.startsWith("helm-provision preflight ")) {
+      target.emit(
+        `HELM_PROVISION_PREFLIGHT_SUCCESS session=${PREFLIGHT_TOKEN} profile=${PROFILE} device=${DEVICE} inventory=${INVENTORY}\r\n`,
+      );
+      return;
+    }
+    if (command.startsWith("helm-provision install ")) {
+      installPort = target;
+      target.emit(
+        `HELM_PROVISION_PROGRESS session=${staleToken} step=1 phase=nvme-install\r\n` +
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=1 phase=nvme-install\r\n` +
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=1 phase=nvme-install\r\n` +
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=3 phase=qspi-write\r\n` +
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=2 phase=qspi-backup\r\n` +
+        `HELM_PROVISION_PROGRESS session=${INSTALL_TOKEN} step=4 phase=qspi-verify\r\n`,
+      );
+    }
+  });
+  const transport = new WebSerialTransport({ serial: fakeSerialFor(port) });
+  await transport.requestAndOpen();
+  const tokens = [PREFLIGHT_TOKEN, INSTALL_TOKEN];
+  const session = new RecoverySession(transport, { tokenFactory: () => tokens.shift() });
+  const preflight = await session.preflight(PROFILE, DEVICE, { timeoutMs: 1_000 });
+  const seen = [];
+  let settled = false;
+  const installing = session.install(preflight.confirmation, {
+    timeoutMs: 1_000,
+    onProgress(marker) {
+      seen.push(`${marker.step}:${marker.phase}`);
+      if (marker.step === 3) {
+        throw new Error("rendering failed");
+      }
+      if (marker.step === 4) {
+        fourthProgressResolve();
+      }
+    },
+  });
+  void installing.finally(() => {
+    settled = true;
+  });
+  await fourthProgress;
+  await Promise.resolve();
+  assert.equal(settled, false);
+  assert.deepEqual(seen, [
+    "1:nvme-install",
+    "3:qspi-write",
+    "4:qspi-verify",
+  ]);
+  installPort.emit(
+    `HELM_PROVISION_SUCCESS session=${INSTALL_TOKEN} profile=${PROFILE} device=${DEVICE}\r\n`,
+  );
+  assert.deepEqual(await installing, { profile: PROFILE, device: DEVICE });
   await transport.close();
 });
 

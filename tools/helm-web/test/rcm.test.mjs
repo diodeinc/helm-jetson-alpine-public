@@ -30,6 +30,16 @@ function bytes(value) {
   return typeof value === "string" ? encoder.encode(value) : new Uint8Array(value);
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function makeFile(name, value) {
   return new File([bytes(value)], name, { type: "application/octet-stream" });
 }
@@ -321,7 +331,7 @@ test("68-byte banner parser preserves the native loader semantics", () => {
   assert.throws(() => parseBootloaderBanner(new Uint8Array(67)), /expected 68/);
 });
 
-test("WebUSB boot mirrors the exact two-stage six-file RCM stream", async () => {
+test("WebUSB boot uses two explicit grants for the exact six-file RCM stream", async () => {
   const largeBlob = Uint8Array.from(
     { length: WRITE_CHUNK_SIZE + 19 },
     (_, index) => (index * 17) & 0xff,
@@ -346,11 +356,20 @@ test("WebUSB boot mirrors the exact two-stage six-file RCM stream", async () => 
   let deviceQuery = 0;
   const usb = new FakeUsb(bootrom, () => {
     deviceQuery += 1;
-    return deviceQuery === 1 ? [bootrom] : [bootloader];
+    return deviceQuery === 1 ? [bootrom] : [];
   });
   const progress = [];
   const transport = new T234WebUsbRcm({ usb });
-  const result = await transport.boot(bootrom, bundle, {
+  const handoff = await transport.bootrom(bootrom, bundle, {
+    onProgress: (event) => progress.push(event),
+  });
+  assert.equal(handoff.cid, "0xCID");
+  assert.equal(progress.at(-1).type, "handoff");
+
+  usb.selected = bootloader;
+  usb.authorized = [bootloader];
+  assert.equal(await transport.requestBootloaderDevice(handoff), bootloader);
+  const result = await transport.bootloader(bootloader, bundle, handoff, {
     onProgress: (event) => progress.push(event),
   });
 
@@ -377,9 +396,201 @@ test("WebUSB boot mirrors the exact two-stage six-file RCM stream", async () => 
   );
   assert.equal(progress.at(-1).type, "complete");
   assert.equal(usb.listeners.size, 0);
+  await assert.rejects(
+    transport.bootloader(bootloader, bundle, handoff),
+    /matching completed BootROM handoff/,
+  );
 });
 
-test("handoff fails closed when more than one matching APX device appears", async () => {
+test("MB1 I/O requires the APX object returned by a fresh second chooser", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bootrom = new FakeDevice(0x7423, { serialNumber: "" });
+  const usb = new FakeUsb(bootrom, [bootrom]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+
+  await assert.rejects(
+    transport.bootloader(bootrom, bundle, handoff),
+    /fresh second chooser grant/,
+  );
+  assert.equal(
+    bootrom.calls.filter((entry) => entry === "open").length,
+    1,
+  );
+});
+
+test("second chooser is one-at-a-time and cancellation remains retryable", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bannerBytes = new Uint8Array(BOOTLOADER_BANNER_SIZE);
+  bannerBytes.set(encoder.encode("retry MB1"));
+  const device = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: bannerBytes,
+  });
+  const usb = new FakeUsb(device, [device]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(device, bundle);
+
+  const firstChooser = deferred();
+  const chooserRequests = [];
+  usb.requestDevice = async (options) => {
+    chooserRequests.push(options);
+    if (chooserRequests.length === 1) {
+      return firstChooser.promise;
+    }
+    return device;
+  };
+
+  const cancelledSelection = transport.requestBootloaderDevice(handoff);
+  await assert.rejects(
+    transport.requestBootloaderDevice(handoff),
+    /selection is already pending/,
+  );
+  firstChooser.reject(new DOMException("chooser closed", "NotFoundError"));
+  await assert.rejects(
+    cancelledSelection,
+    (error) => error instanceof DOMException && error.name === "NotFoundError",
+  );
+
+  assert.equal(await transport.requestBootloaderDevice(handoff), device);
+  await assert.rejects(
+    transport.requestBootloaderDevice(handoff),
+    /selection has already completed/,
+  );
+  assert.deepEqual(chooserRequests, [
+    { filters: [{ vendorId: 0x0955, productId: 0x7423 }] },
+    { filters: [{ vendorId: 0x0955, productId: 0x7423 }] },
+  ]);
+  const result = await transport.bootloader(device, bundle, handoff);
+  assert.equal(result.banner.version, "retry MB1");
+});
+
+test("fresh second chooser may return Chrome's reused APX wrapper", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bannerBytes = new Uint8Array(BOOTLOADER_BANNER_SIZE);
+  bannerBytes.set(encoder.encode("reused-wrapper MB1"));
+  const device = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: bannerBytes,
+  });
+  const usb = new FakeUsb(device, [device]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(device, bundle);
+
+  assert.equal(await transport.requestBootloaderDevice(handoff), device);
+  const result = await transport.bootloader(device, bundle, handoff);
+  assert.equal(result.banner.version, "reused-wrapper MB1");
+  assert.deepEqual(
+    concatenate(device.output),
+    expectedSet(fixture.content, RCM_ARTIFACTS),
+  );
+});
+
+test("bootloader handoff is consumed before asynchronous authorization", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bannerBytes = new Uint8Array(BOOTLOADER_BANNER_SIZE);
+  bannerBytes.set(encoder.encode("one-shot MB1"));
+  const device = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: bannerBytes,
+  });
+  const usb = new FakeUsb(device, [device]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(device, bundle);
+  await transport.requestBootloaderDevice(handoff);
+
+  const authorization = deferred();
+  let authorizationQueries = 0;
+  usb.getDevices = async () => {
+    authorizationQueries += 1;
+    return authorization.promise;
+  };
+  const firstBootloader = transport.bootloader(device, bundle, handoff);
+  await assert.rejects(
+    transport.bootloader(device, bundle, handoff),
+    /matching completed BootROM handoff/,
+  );
+  authorization.resolve([device]);
+
+  const result = await firstBootloader;
+  assert.equal(result.banner.version, "one-shot MB1");
+  assert.equal(authorizationQueries, 1);
+  assert.deepEqual(
+    concatenate(device.output),
+    expectedSet(fixture.content, RCM_ARTIFACTS),
+  );
+});
+
+test("short same-wrapper banner sends no stage-two artifacts and consumes handoff", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const device = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: new Uint8Array(BOOTLOADER_BANNER_SIZE - 1),
+  });
+  const usb = new FakeUsb(device, [device]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(device, bundle);
+  await transport.requestBootloaderDevice(handoff);
+
+  await assert.rejects(
+    transport.bootloader(device, bundle, handoff),
+    /invalid progress while reading bootloader banner/,
+  );
+  assert.deepEqual(
+    concatenate(device.output),
+    expectedSet(fixture.content, RCM_BOOTROM_ARTIFACTS),
+  );
+  await assert.rejects(
+    transport.bootloader(device, bundle, handoff),
+    /matching completed BootROM handoff/,
+  );
+});
+
+test("bootloader rejects an object other than the exact second chooser result", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bannerBytes = new Uint8Array(BOOTLOADER_BANNER_SIZE);
+  bannerBytes.set(encoder.encode("selected MB1"));
+  const bootrom = new FakeDevice(0x7423, { serialNumber: "" });
+  const selected = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: bannerBytes,
+  });
+  const foreign = new FakeDevice(0x7423, { serialNumber: "" });
+  const usb = new FakeUsb(bootrom, [bootrom]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+  usb.selected = selected;
+  usb.authorized = [selected];
+  await transport.requestBootloaderDevice(handoff);
+
+  await assert.rejects(
+    transport.bootloader(foreign, bundle, handoff),
+    /fresh second chooser grant/,
+  );
+  assert.equal(foreign.calls.length, 0);
+  const result = await transport.bootloader(selected, bundle, handoff);
+  assert.equal(result.banner.version, "selected MB1");
+});
+
+test("second grant fails closed when more than one matching APX is authorized", async () => {
   const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
   const bundle = await validateRcmBundle(fixture.files, {
     expectedProfileId: fixture.definition.id,
@@ -388,41 +599,113 @@ test("handoff fails closed when more than one matching APX device appears", asyn
   let deviceQuery = 0;
   const usb = new FakeUsb(bootrom, () => {
     deviceQuery += 1;
-    return deviceQuery === 1 ? [bootrom] : [
-      new FakeDevice(0x7423),
-      new FakeDevice(0x7423),
-    ];
+    return deviceQuery === 1 ? [bootrom] : [];
   });
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+  const bootloader = new FakeDevice(0x7423);
+  usb.selected = bootloader;
+  await transport.requestBootloaderDevice(handoff);
+  usb.authorized = [bootloader, new FakeDevice(0x7423)];
   await assert.rejects(
-    new T234WebUsbRcm({ usb }).boot(bootrom, bundle),
-    /expected exactly one/,
+    transport.bootloader(bootloader, bundle, handoff),
+    /sole authorized device/,
   );
 });
 
-test("serialless handoff cannot switch to a new object without a disconnect", async () => {
+test("serialless BootROM keeps PID-wide uniqueness if MB1 reports a serial", async () => {
   const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
   const bundle = await validateRcmBundle(fixture.files, {
     expectedProfileId: fixture.definition.id,
   });
   const bootrom = new FakeDevice(0x7423, { serialNumber: "" });
-  const unrelated = new FakeDevice(0x7423, { serialNumber: "" });
+  const usb = new FakeUsb(bootrom, [bootrom]);
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+  const bootloader = new FakeDevice(0x7423, { serialNumber: "mb1-serial" });
+  usb.selected = bootloader;
+  await transport.requestBootloaderDevice(handoff);
+  usb.authorized = [bootloader, new FakeDevice(0x7423, { serialNumber: "other" })];
+
+  await assert.rejects(
+    transport.bootloader(bootloader, bundle, handoff),
+    /only authorized device with that VID\/PID/,
+  );
+  assert.equal(bootloader.calls.length, 0);
+});
+
+test("serialless T234 succeeds through a second chooser grant after re-enumeration", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bootrom = new FakeDevice(0x7423, { serialNumber: "" });
+  const bannerBytes = new Uint8Array(BOOTLOADER_BANNER_SIZE);
+  bannerBytes.set(encoder.encode("serialless MB1"));
+  const bootloader = new FakeDevice(0x7423, {
+    serialNumber: "",
+    banner: bannerBytes,
+  });
   let deviceQuery = 0;
   const usb = new FakeUsb(bootrom, () => {
     deviceQuery += 1;
-    return deviceQuery === 1 ? [bootrom] : [unrelated];
+    return deviceQuery === 1 ? [bootrom] : [];
   });
-  let clock = 0;
-  const transport = new T234WebUsbRcm({
-    usb,
-    timeouts: { handoff: 3, poll: 1 },
-    now: () => clock,
-    sleep: async (milliseconds) => { clock += milliseconds; },
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+
+  usb.selected = bootloader;
+  usb.authorized = [bootloader];
+  const selected = await transport.requestBootloaderDevice(handoff);
+  const result = await transport.bootloader(selected, bundle, handoff);
+  assert.equal(result.cid, "0xCID");
+  assert.equal(result.banner.version, "serialless MB1");
+  assert.equal(result.bytesSent, bundle.totalBytes);
+});
+
+test("stable serial mismatch and foreign transport fail before MB1 opens", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
   });
+  const bootrom = new FakeDevice(0x7423, { serialNumber: "original" });
+  let deviceQuery = 0;
+  const usb = new FakeUsb(bootrom, () => {
+    deviceQuery += 1;
+    return deviceQuery === 1 ? [bootrom] : [];
+  });
+  const transport = new T234WebUsbRcm({ usb });
+  const handoff = await transport.bootrom(bootrom, bundle);
+  const bootloader = new FakeDevice(0x7423, { serialNumber: "different" });
+  usb.selected = bootloader;
+  await transport.requestBootloaderDevice(handoff);
+  usb.authorized = [bootloader];
   await assert.rejects(
-    transport.boot(bootrom, bundle),
-    /did not return for bootloader stage/,
+    transport.bootloader(bootloader, bundle, handoff),
+    /serial does not match/,
   );
-  assert.equal(unrelated.calls.length, 0);
+  assert.equal(bootloader.calls.length, 0);
+  await assert.rejects(
+    new T234WebUsbRcm({ usb }).requestBootloaderDevice(handoff),
+    /this transport's completed BootROM handoff/,
+  );
+});
+
+test("bootloader stage rejects a forged or mismatched handoff", async () => {
+  const fixture = buildFixture("helm-orin-nx-8gb-r39.2");
+  const bundle = await validateRcmBundle(fixture.files, {
+    expectedProfileId: fixture.definition.id,
+  });
+  const bootloader = new FakeDevice(0x7423);
+  const usb = new FakeUsb(bootloader, [bootloader]);
+  await assert.rejects(
+    new T234WebUsbRcm({ usb }).bootloader(
+      bootloader,
+      bundle,
+      Object.freeze({ cid: "0xforged" }),
+    ),
+    /matching completed BootROM handoff/,
+  );
 });
 
 test("timeouts are deterministic and invoke transport cleanup", async () => {
