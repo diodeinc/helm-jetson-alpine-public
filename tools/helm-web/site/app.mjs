@@ -76,6 +76,7 @@ const elements = Object.freeze({
   statusTitle: requireElement("status-title"),
   statusDetail: requireElement("status-detail"),
   statusChip: requireElement("status-chip"),
+  statusChipLabel: requireElement("status-chip-label"),
   progressPanel: requireElement("progress-panel"),
   progressTitle: requireElement("progress-title"),
   progressPercent: requireElement("progress-percent"),
@@ -140,7 +141,7 @@ function setStatus(title, detail, tone = "ready", chip = "Ready") {
   elements.statusTitle.textContent = title;
   elements.statusDetail.textContent = detail;
   elements.statusChip.dataset.tone = tone;
-  elements.statusChip.lastChild.textContent = chip;
+  elements.statusChipLabel.textContent = chip;
 }
 
 function setStep(id, stepState, label) {

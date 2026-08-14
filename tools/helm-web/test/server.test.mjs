@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -66,6 +66,25 @@ test("range parser accepts one bounded byte range", () => {
   assert.equal(parseRange("bytes=10-", 10), false);
   assert.equal(parseRange("bytes=1-2,4-5", 10), false);
   assert.equal(parseRange("items=1-2", 10), false);
+});
+
+test("site keeps the Diode theme and an explicit status-chip label", async () => {
+  const site = fileURLToPath(new URL("../site/", import.meta.url));
+  const [html, app, styles] = await Promise.all([
+    readFile(path.join(site, "index.html"), "utf8"),
+    readFile(path.join(site, "app.mjs"), "utf8"),
+    readFile(path.join(site, "styles.css"), "utf8"),
+  ]);
+
+  assert.match(html, /<meta name="color-scheme" content="dark">/);
+  assert.match(html, /<svg class="diode-mark"/);
+  assert.match(html, /<span id="status-chip-label">Checking<\/span>/);
+  assert.match(app, /statusChipLabel: requireElement\("status-chip-label"\)/);
+  assert.match(app, /elements\.statusChipLabel\.textContent = chip;/);
+  assert.doesNotMatch(app, /statusChip\.lastChild/);
+  assert.match(styles, /--paper-bg: #121212;/);
+  assert.match(styles, /--diode-green: #01d492;/);
+  assert.match(styles, /--danger-hover: #b91c1c;/);
 });
 
 test("server starts when its entry point is reached through a release symlink", async () => {

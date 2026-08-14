@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="dark">
     <meta name="description" content="Provision a Diode Helm from desktop Chrome over one USB cable.">
     <meta property="og:type" content="website">
     <meta property="og:title" content="Helm Browser Flasher">
@@ -17,8 +17,22 @@
   </head>
   <body>
     <header class="topbar">
-      <a class="product-name" href="/helm/">Helm Flasher</a>
-      <span class="preview-label">Developer preview · Chrome / Chromium</span>
+      <a class="product-name" href="/helm/" aria-label="Diode Helm Provisioner">
+        <svg class="diode-mark" viewBox="6 2 90 72" aria-hidden="true">
+          <path d="M13.345 38.264h16.348" stroke-width="7.525" />
+          <path d="M32.221 11.816v52.818" stroke-width="7.107" />
+          <path d="M72.376 12.079v52.371" stroke-width="7.525" />
+          <path d="M32.244 11.862 67.396 38.027" stroke-width="7.107" />
+          <path d="M32.24 64.543 67.591 38.839" stroke-width="7.107" />
+          <path d="M72.629 38.264h16.348" stroke-width="7.525" />
+          <path d="m63.568 6.185 8.151 5.386" stroke-width="7.525" />
+          <path d="m72.406 64.428 8.11 5.359" stroke-width="7.525" />
+        </svg>
+        <span>Diode</span>
+        <span class="product-divider" aria-hidden="true">/</span>
+        <span class="product-scope">Helm Provisioner</span>
+      </a>
+      <span class="preview-label">Recovery USB · Developer preview</span>
     </header>
 
     <main>
@@ -46,7 +60,7 @@
           <p id="status-detail">Confirming secure USB and serial support.</p>
         </div>
         <span id="status-chip" class="status-chip" data-tone="working">
-          <span class="status-dot" aria-hidden="true"></span><span>Checking</span>
+          <span class="status-dot" aria-hidden="true"></span><span id="status-chip-label">Checking</span>
         </span>
       </section>
 

@@ -1,24 +1,37 @@
 :root {
-  --background: #f6f7f8;
-  --surface: #ffffff;
-  --surface-muted: #f9fafb;
-  --text: #17191c;
-  --muted: #626b77;
-  --faint: #626b77;
-  --line: #dce0e5;
-  --line-strong: #b9c0c9;
-  --accent: #1f5fc4;
-  --accent-hover: #174b9c;
-  --accent-soft: #edf4ff;
-  --success: #177245;
-  --success-soft: #edf8f2;
-  --warning: #925600;
-  --warning-soft: #fff7e8;
-  --danger: #b42318;
-  --danger-hover: #8f1c13;
-  --danger-soft: #fff1ef;
-  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color-scheme: dark;
+  --paper-bg: #121212;
+  --paper-surface: #181716;
+  --hover-surface: #201f1e;
+  --surface-strong: #242321;
+  --ink: #e7e3dc;
+  --muted-ink: #a8a39a;
+  --sub-ink: #8a857c;
+  --line: #2a2927;
+  --line-strong: #3a3834;
+  --diode-green: #01d492;
+  --background: var(--paper-bg);
+  --surface: var(--paper-surface);
+  --surface-muted: var(--hover-surface);
+  --text: var(--ink);
+  --muted: var(--muted-ink);
+  --faint: var(--sub-ink);
+  --accent: var(--diode-green);
+  --accent-hover: #2be0a8;
+  --accent-soft: rgba(1, 212, 146, 0.08);
+  --success: #4ade80;
+  --success-soft: rgba(34, 197, 94, 0.1);
+  --success-line: rgba(34, 197, 94, 0.3);
+  --warning: #fbbf24;
+  --warning-soft: rgba(234, 179, 8, 0.1);
+  --warning-line: rgba(234, 179, 8, 0.3);
+  --danger: #f87171;
+  --danger-action: #dc2626;
+  --danger-hover: #b91c1c;
+  --danger-soft: rgba(220, 38, 38, 0.1);
+  --danger-line: rgba(220, 38, 38, 0.3);
+  --mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 * {
@@ -34,6 +47,7 @@ html {
 }
 
 body {
+  background: var(--background);
   margin: 0;
   min-height: 100vh;
 }
@@ -60,54 +74,83 @@ pre:focus-visible {
 
 .topbar {
   align-items: center;
-  background: var(--surface);
+  background: var(--background);
   border-bottom: 1px solid var(--line);
   display: flex;
   justify-content: space-between;
-  min-height: 56px;
-  padding: 0 max(24px, calc((100vw - 880px) / 2));
+  min-height: 44px;
+  padding: 0 max(20px, calc((100vw - 860px) / 2));
 }
 
 .product-name {
+  align-items: center;
   color: var(--text);
-  font-size: 0.9rem;
+  display: inline-flex;
+  font-family: var(--mono);
+  font-size: 0.7rem;
   font-weight: 700;
+  gap: 7px;
+  letter-spacing: 0.04em;
   text-decoration: none;
+  text-transform: uppercase;
+}
+
+.diode-mark {
+  color: var(--accent);
+  fill: none;
+  flex: 0 0 auto;
+  height: 20px;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: miter;
+  width: 20px;
+}
+
+.product-divider {
+  color: var(--faint);
+}
+
+.product-scope {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .preview-label {
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 0.68rem;
+  font-size: 0.59rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 main {
   margin: 0 auto;
-  max-width: 880px;
-  padding: 38px 24px 64px;
+  max-width: 860px;
+  padding: 28px 20px 56px;
 }
 
 .intro {
-  margin-bottom: 24px;
+  margin-bottom: 18px;
 }
 
 .intro h1 {
-  font-size: clamp(1.8rem, 5vw, 2.35rem);
-  letter-spacing: -0.035em;
-  line-height: 1.1;
-  margin: 0 0 7px;
+  font-family: var(--mono);
+  font-size: clamp(1.35rem, 4vw, 1.65rem);
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  margin: 0 0 5px;
 }
 
 .intro p {
   color: var(--muted);
-  font-size: 0.95rem;
+  font-size: 0.82rem;
   margin: 0;
 }
 
 .checks {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 0;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   list-style: none;
@@ -170,11 +213,12 @@ main {
 .console {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 0;
 }
 
 .alert {
-  border-color: #efc2bd;
+  background: var(--danger-soft);
+  border-color: var(--danger-line);
   color: var(--danger);
   margin-bottom: 14px;
   padding: 12px 14px;
@@ -189,7 +233,7 @@ main {
   align-items: center;
   display: flex;
   justify-content: space-between;
-  padding: 16px 18px;
+  padding: 14px 16px;
 }
 
 .panel-label {
@@ -197,11 +241,13 @@ main {
   display: block;
   font-family: var(--mono);
   font-size: 0.61rem;
+  letter-spacing: 0.08em;
   margin-bottom: 3px;
   text-transform: uppercase;
 }
 
 .status-panel h2 {
+  font-family: var(--mono);
   font-size: 1rem;
   margin: 0 0 2px;
 }
@@ -216,7 +262,7 @@ main {
   align-items: center;
   background: var(--surface-muted);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 2px;
   color: var(--muted);
   display: inline-flex;
   flex: 0 0 auto;
@@ -238,19 +284,19 @@ main {
 .status-chip[data-tone="ready"],
 .status-chip[data-tone="success"] {
   background: var(--success-soft);
-  border-color: #b9ddca;
+  border-color: var(--success-line);
   color: var(--success);
 }
 
 .status-chip[data-tone="warning"] {
   background: var(--warning-soft);
-  border-color: #edd39c;
+  border-color: var(--warning-line);
   color: var(--warning);
 }
 
 .status-chip[data-tone="danger"] {
   background: var(--danger-soft);
-  border-color: #efc2bd;
+  border-color: var(--danger-line);
   color: var(--danger);
 }
 
@@ -276,15 +322,15 @@ main {
 
 progress {
   appearance: none;
-  background: #e7ebef;
+  background: var(--line-strong);
   border: 0;
   display: block;
-  height: 4px;
+  height: 2px;
   width: 100%;
 }
 
 progress::-webkit-progress-bar {
-  background: #e7ebef;
+  background: var(--line-strong);
 }
 
 progress::-webkit-progress-value {
@@ -342,7 +388,7 @@ progress::-moz-progress-bar {
 .step-card {
   border-bottom: 1px solid var(--line);
   box-shadow: inset 3px 0 transparent;
-  padding: 20px 22px 20px 24px;
+  padding: 17px 19px 17px 21px;
 }
 
 .step-card:last-child {
@@ -390,6 +436,7 @@ progress::-moz-progress-bar {
 }
 
 .step-heading h2 {
+  font-family: var(--mono);
   font-size: 0.95rem;
   margin: 0;
 }
@@ -438,11 +485,11 @@ code {
 
 select,
 input[type="text"] {
-  background: var(--surface);
+  background: var(--surface-strong);
   border: 1px solid var(--line-strong);
-  border-radius: 5px;
+  border-radius: 2px;
   color: var(--text);
-  min-height: 40px;
+  min-height: 36px;
   padding: 8px 10px;
   width: calc(100% - 32px);
 }
@@ -453,7 +500,7 @@ select {
 
 select:disabled,
 input:disabled {
-  background: #f0f2f4;
+  background: var(--surface-muted);
   color: var(--faint);
 }
 
@@ -478,11 +525,11 @@ input:disabled {
 
 .button {
   border: 0;
-  border-radius: 5px;
+  border-radius: 2px;
   cursor: pointer;
   font-size: 0.72rem;
   font-weight: 650;
-  min-height: 38px;
+  min-height: 34px;
   padding: 8px 13px;
 }
 
@@ -493,7 +540,7 @@ input:disabled {
 
 .button-primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--background);
 }
 
 .button-primary:hover:not(:disabled) {
@@ -501,7 +548,7 @@ input:disabled {
 }
 
 .button-danger {
-  background: var(--danger);
+  background: var(--danger-action);
   color: #fff;
 }
 
@@ -522,7 +569,7 @@ input:disabled {
 
 .inventory {
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 0;
   display: grid;
   grid-template-columns: 1fr 1.5fr;
   margin: 14px 0 14px 32px;
@@ -571,8 +618,8 @@ input:disabled {
 
 .confirmation-phrase {
   background: var(--danger-soft);
-  border: 1px solid #efc2bd;
-  border-radius: 5px;
+  border: 1px solid var(--danger-line);
+  border-radius: 0;
   color: var(--danger);
   display: block;
   font-size: 0.67rem;
@@ -584,7 +631,7 @@ input:disabled {
 }
 
 .confirmation input {
-  border-color: #d59b95;
+  border-color: var(--danger-line);
   font-family: var(--mono);
   font-size: 0.7rem;
   width: 100%;
@@ -641,7 +688,7 @@ input:disabled {
 
 .install-stages {
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 0;
   list-style: none;
   margin: 0;
   overflow: hidden;
@@ -748,9 +795,9 @@ body.install-state-unknown .progress-panel progress {
 }
 
 .console pre {
-  background: #14171b;
-  border-top: 1px solid #292e35;
-  color: #c7d0d9;
+  background: #0d0d0d;
+  border-top: 1px solid var(--line);
+  color: #d8d2c5;
   font-family: var(--mono);
   font-size: 0.67rem;
   line-height: 1.55;
@@ -822,6 +869,7 @@ body.install-state-unknown .progress-panel progress {
 
   select,
   input[type="text"] {
+    min-height: 44px;
     width: 100%;
   }
 
@@ -843,6 +891,13 @@ body.install-state-unknown .progress-panel progress {
   }
 
   .button {
+    min-height: 44px;
     width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .preview-label {
+    display: none;
   }
 }
