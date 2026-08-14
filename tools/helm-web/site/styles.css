@@ -4,7 +4,7 @@
   --surface-muted: #f9fafb;
   --text: #17191c;
   --muted: #626b77;
-  --faint: #858e99;
+  --faint: #626b77;
   --line: #dce0e5;
   --line-strong: #b9c0c9;
   --accent: #1f5fc4;
@@ -300,6 +300,7 @@ progress::-moz-progress-bar {
   font-family: var(--mono);
   font-size: 0.62rem;
   margin: 7px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .hardware-gate {

@@ -55,7 +55,13 @@
           <strong id="progress-title">Preparing</strong>
           <span id="progress-percent">0%</span>
         </div>
-        <progress id="progress-bar" max="100" value="0">0%</progress>
+        <progress
+          id="progress-bar"
+          max="100"
+          value="0"
+          aria-labelledby="progress-title"
+          aria-describedby="progress-detail"
+        >0%</progress>
         <p id="progress-detail"></p>
       </section>
 
@@ -164,7 +170,7 @@
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
-              aria-describedby="confirmation-help"
+              aria-describedby="confirmation-phrase confirmation-help"
             >
             <p id="confirmation-help" class="field-help">The device, profile, and fingerprint must match.</p>
           </div>
