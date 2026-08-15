@@ -78,13 +78,28 @@ test("site keeps the Diode theme and an explicit status-chip label", async () =>
 
   assert.match(html, /<meta name="color-scheme" content="dark">/);
   assert.match(html, /<svg class="diode-mark"/);
+  assert.match(html, /<span class="product-scope">Helm<\/span>/);
+  assert.match(html, /<span class="preview-label">Recovery USB<\/span>/);
+  assert.match(html, /<main aria-label="Helm provisioning">/);
+  assert.doesNotMatch(html, /<h1\b/);
+  assert.doesNotMatch(html, /Provision Helm|Helm Provisioner|Install Alpine to NVMe/);
   assert.match(html, /<span id="status-chip-label">Checking<\/span>/);
+  assert.match(html, /<h2>Detect module<\/h2>/);
+  assert.match(html, /<label class="field-label" for="profile-select">Manual profile<\/label>/);
+  assert.match(html, /Detect Helm/);
+  assert.match(html, /<section id="session-details" class="console"/);
+  assert.doesNotMatch(html, /<details id="session-details"/);
   assert.match(app, /statusChipLabel: requireElement\("status-chip-label"\)/);
   assert.match(app, /elements\.statusChipLabel\.textContent = chip;/);
+  assert.match(app, /requestAnyApxDevice\(navigator\.usb\)/);
+  assert.match(app, /uniqueProfileByProductId\(device\.productId\)/);
+  assert.doesNotMatch(app, /sessionDetails\.open/);
   assert.doesNotMatch(app, /statusChip\.lastChild/);
   assert.match(styles, /--paper-bg: #121212;/);
   assert.match(styles, /--diode-green: #01d492;/);
   assert.match(styles, /--danger-hover: #b91c1c;/);
+  assert.match(styles, /grid-template-areas: "workflow console";/);
+  assert.match(styles, /position: sticky;/);
 });
 
 test("server starts when its entry point is reached through a release symlink", async () => {

@@ -163,7 +163,9 @@ Chromium at
 <https://preview.example.invalid/helm>. Connect exactly one Helm,
 keep it powered, and use its recovery USB port. It is still one physical cable,
 but the browser asks for BootROM WebUSB access, MB1/PSC WebUSB access after APX
-re-enumerates, and finally the recovery Web Serial port.
+re-enumerates, and finally the recovery Web Serial port. The first chooser also
+detects the module profile for the three unambiguous APX product IDs and reuses
+that authorization for the BootROM transfer.
 
 The page downloads only the selected exact-SKU bundle, verifies every file
 against the same-origin catalog and embedded SHA256SUMS, and performs a
@@ -172,11 +174,12 @@ preflight and requires the same inventory-bound exact phrase before any
 persistent write. P3767-0003 and P3767-0005 still require an explicit module
 choice because both use PID `0955:7523`.
 
-This is not yet the qualified customer path: a real T234 BootROM-to-MB1
-WebUSB permission handoff still needs physical Chrome testing. A public rollout
-also needs its own trusted origin (for example `flash.diode.com`); the current
-host is private to the tailnet, and the raw `192.0.2.1` URL is not a valid
-WebUSB HTTPS origin.
+The complete browser flow has been exercised physically on P3767-0001, including
+the two-grant T234 BootROM-to-MB1 handoff and verified NVMe/QSPI provisioning.
+It remains a developer preview until it has broader Chrome/macOS and exact-SKU
+qualification. A public rollout also needs its own trusted origin (for example
+`flash.diode.com`); the current host is private to the tailnet, and the raw
+`192.0.2.1` URL is not a valid WebUSB HTTPS origin.
 
 For manual recovery or diagnosis, the underlying non-writing steps remain:
 

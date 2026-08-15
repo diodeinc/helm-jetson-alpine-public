@@ -65,22 +65,25 @@ export function webUsbFilters(productId = undefined) {
   }));
 }
 
-export function assertApxDevice(device, expectedProductId) {
+export function assertApxDevice(device, expectedProductId = undefined) {
+  const expectedMatches = expectedProductId === undefined ||
+    device?.productId === expectedProductId;
   if (!device || device.vendorId !== NVIDIA_VENDOR_ID ||
-      device.productId !== expectedProductId ||
-      !supportedProductId(device.productId)) {
+      !supportedProductId(device.productId) || !expectedMatches) {
     const actual = device
       ? `${formatUsbId(device.vendorId)}:${formatUsbId(device.productId)}`
       : "no device";
+    const expected = expectedProductId === undefined
+      ? `a supported ${formatUsbId(NVIDIA_VENDOR_ID)} T234 APX device`
+      : `${formatUsbId(NVIDIA_VENDOR_ID)}:${formatUsbId(expectedProductId)}`;
     throw new ApxWebUsbError(
-      `selected USB device is ${actual}; expected ` +
-      `${formatUsbId(NVIDIA_VENDOR_ID)}:${formatUsbId(expectedProductId)}`,
+      `selected USB device is ${actual}; expected ${expected}`,
     );
   }
   return device;
 }
 
-export async function requestApxDevice(usb, expectedProductId) {
+async function requestFilteredApxDevice(usb, expectedProductId) {
   if (typeof usb?.requestDevice !== "function") {
     throw new ApxWebUsbError(
       "WebUSB is unavailable; use a Chromium browser in a secure context",
@@ -90,6 +93,17 @@ export async function requestApxDevice(usb, expectedProductId) {
     filters: webUsbFilters(expectedProductId),
   });
   return assertApxDevice(device, expectedProductId);
+}
+
+export async function requestAnyApxDevice(usb) {
+  return requestFilteredApxDevice(usb, undefined);
+}
+
+export async function requestApxDevice(usb, expectedProductId) {
+  if (!supportedProductId(expectedProductId)) {
+    throw new ApxWebUsbError(`unsupported APX product ID: ${expectedProductId}`);
+  }
+  return requestFilteredApxDevice(usb, expectedProductId);
 }
 
 export function withTimeout(promise, timeoutMs, label, onTimeout, timers = {}) {

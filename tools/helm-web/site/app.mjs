@@ -3,6 +3,8 @@ import {
   RCM_ARTIFACTS,
   T234WebUsbRcm,
   profileById,
+  requestAnyApxDevice,
+  uniqueProfileByProductId,
   validateRcmBundle,
 } from "./modules/index.js";
 import {
@@ -96,6 +98,7 @@ const state = {
   catalogReady: false,
   browserReady: false,
   selectedProfile: null,
+  bootromDevice: null,
   preparedBundle: null,
   busy: null,
   rcm: null,
@@ -239,7 +242,6 @@ function renderInstallStages({ complete = false, failed = false } = {}) {
 function startInstallProgress() {
   document.body.classList.add("install-active");
   document.body.classList.remove("install-complete", "install-state-unknown");
-  elements.sessionDetails.open = false;
   elements.installProgress.hidden = false;
   elements.installProgressDevice.textContent = state.preflight?.device ?? TARGET_DEVICE;
   elements.installProgressProfile.textContent = state.preflight?.profile ?? state.selectedProfile?.id ?? "—";
@@ -502,7 +504,7 @@ function renderProfileOptions() {
   elements.profileSelect.replaceChildren();
   const placeholder = document.createElement("option");
   placeholder.value = "";
-  placeholder.textContent = "Select the exact module SKU…";
+  placeholder.textContent = "Detect from APX or select manually…";
   elements.profileSelect.append(placeholder);
   for (const definition of PROFILE_DEFINITIONS) {
     const profile = state.catalogProfiles.get(definition.id);
@@ -524,6 +526,11 @@ function clearPreparedBundle() {
   state.rcm = null;
   state.rcmHandoff = null;
   state.selectedProfile = selectedCatalogProfile();
+  if (state.bootromDevice !== null &&
+      (state.selectedProfile === null ||
+       state.selectedProfile.productId !== state.bootromDevice.productId)) {
+    state.bootromDevice = null;
+  }
   setStep("step-prepare", "current", "Ready");
   setStep("step-boot", "locked", "Locked");
   elements.progressPanel.hidden = true;
@@ -537,8 +544,18 @@ function handleProfileChange() {
   const profile = state.selectedProfile;
   elements.sharedPidNote.hidden = profile?.productId !== SHARED_APX_PRODUCT_ID;
   if (profile === null) {
-    elements.bundleSummary.textContent = "No profile selected";
-    setStatus("Select the exact Helm profile", "The browser will verify it against the APX USB identity.", "ready", "Ready");
+    const detectedSharedPid = state.bootromDevice?.productId === SHARED_APX_PRODUCT_ID;
+    elements.bundleSummary.textContent = detectedSharedPid
+      ? "Choose P3767-0003 or P3767-0005"
+      : "APX not detected";
+    setStatus(
+      detectedSharedPid ? "Module label required" : "Ready to detect Helm",
+      detectedSharedPid
+        ? "APX PID 7523 is shared; select the exact SKU from the module label."
+        : "Detect from APX, or select manually.",
+      detectedSharedPid ? "warning" : "ready",
+      detectedSharedPid ? "Choose SKU" : "Ready",
+    );
   } else {
     const bytes = profile.files.reduce((total, file) => total + file.size, 0);
     elements.bundleSummary.textContent = `${profile.board} · ${formatBytes(bytes)} download`;
@@ -558,10 +575,14 @@ function updateControls() {
   const acknowledged = elements.singleBoardAck.checked;
   const supported = state.browserReady && state.catalogReady;
   elements.profileSelect.disabled = !state.catalogReady || !idle || state.bootComplete;
-  elements.prepareButton.disabled = !supported || !idle || !acknowledged || state.selectedProfile === null || state.preparedBundle !== null || state.bootComplete;
+  const canDetectOrPrepare = state.selectedProfile !== null || state.bootromDevice === null;
+  elements.prepareButton.disabled = !supported || !idle || !acknowledged || !canDetectOrPrepare || state.preparedBundle !== null || state.bootComplete;
+  elements.prepareButton.textContent = state.selectedProfile === null
+    ? (state.bootromDevice === null ? "Detect Helm" : "Select exact SKU")
+    : "Download and verify";
   elements.bootButton.disabled = !supported || !idle || !acknowledged || state.preparedBundle === null || state.bootComplete;
   elements.bootButton.textContent = state.rcmHandoff === null
-    ? "Select BootROM APX and start"
+    ? (state.bootromDevice === null ? "Select BootROM APX and start" : "Start RAM boot")
     : "Select MB1 APX and continue";
   elements.recoveryButton.disabled = !supported || !idle || !state.bootComplete || state.preflight !== null || state.persistentStateUnknown;
   const exactConfirmation = state.preflight !== null &&
@@ -658,24 +679,115 @@ async function downloadAndValidate(profile) {
 }
 
 async function handlePrepare() {
-  const profile = state.selectedProfile;
-  if (profile === null || state.busy !== null || !elements.singleBoardAck.checked) {
+  if (state.busy !== null || !elements.singleBoardAck.checked) {
     return;
   }
+  const detecting = state.bootromDevice === null && state.selectedProfile === null;
   state.busy = "prepare";
   state.preparedBundle = null;
-  setStep("step-prepare", "working", "Verifying");
-  setStatus("Downloading and verifying", "No USB access is requested during file preparation.", "working", "Working");
-  showProgress("Downloading recovery bundle", 0, "Starting authenticated same-origin download");
-  appendLog(`Preparing trusted bundle for ${profile.id}.`);
+  setStep("step-prepare", "working", detecting ? "Detecting" : "Verifying");
+  setStatus(
+    detecting ? "Select Helm APX" : "Preparing recovery bundle",
+    detecting
+      ? "The selected APX product ID identifies the module when it is unambiguous."
+      : (state.bootromDevice === null
+        ? "The exact manually selected profile will be verified before USB access."
+        : "The previously authorized BootROM device will be reused for RAM boot."),
+    "working",
+    "Working",
+  );
+  appendLog(detecting
+    ? "Requesting one supported T234 APX device for module detection."
+    : (state.bootromDevice === null
+      ? `Preparing manually selected profile ${state.selectedProfile.id}.`
+      : `Reusing detected APX 0955:${state.bootromDevice.productId.toString(16).padStart(4, "0")}.`));
   updateControls();
   try {
+    let profile = state.selectedProfile;
+    if (detecting) {
+      let device;
+      try {
+        // Keep requestDevice as the first awaited operation in this click branch:
+        // WebUSB permission requires a live, transient user activation.
+        device = await requestAnyApxDevice(navigator.usb);
+      } catch (error) {
+        const cancelled = error instanceof DOMException && error.name === "NotFoundError";
+        if (!cancelled) {
+          throw error;
+        }
+        setStep("step-prepare", "current", "Select profile");
+        elements.progressPanel.hidden = true;
+        setStatus(
+          "APX selection skipped",
+          "Select the exact module profile manually, or click again to detect it from APX.",
+          "warning",
+          "Manual selection",
+        );
+        appendLog("APX chooser closed; manual module selection remains available.", "warn");
+        return;
+      }
+
+      if (device !== undefined) {
+        state.bootromDevice = device;
+        const detectedDefinition = uniqueProfileByProductId(device.productId);
+        appendLog(
+          `Authorized BootROM APX 0955:${device.productId.toString(16).padStart(4, "0")} for module detection.`,
+          "ok",
+        );
+        if (detectedDefinition !== null) {
+          profile = state.catalogProfiles.get(detectedDefinition.id) ?? null;
+          if (profile === null) {
+            throw new Error(`catalog is missing detected profile ${detectedDefinition.id}`);
+          }
+          elements.profileSelect.value = profile.id;
+          state.selectedProfile = profile;
+          elements.sharedPidNote.hidden = true;
+          const bytes = profile.files.reduce((total, file) => total + file.size, 0);
+          elements.bundleSummary.textContent = `${profile.board} · ${formatBytes(bytes)} download`;
+          appendLog(`Detected ${profile.id} (${profile.board}) from APX PID.`, "ok");
+        } else {
+          profile = null;
+          state.selectedProfile = null;
+          elements.profileSelect.value = "";
+          elements.sharedPidNote.hidden = false;
+          elements.bundleSummary.textContent = "Choose P3767-0003 or P3767-0005";
+          setStep("step-prepare", "current", "Select SKU");
+          elements.progressPanel.hidden = true;
+          setStatus(
+            "Module label required",
+            "APX PID 7523 is shared. Select P3767-0003 or P3767-0005 explicitly; the browser will not guess.",
+            "warning",
+            "Choose SKU",
+          );
+          appendLog(
+            "APX PID 0955:7523 is ambiguous between P3767-0003 and P3767-0005; explicit selection required.",
+            "warn",
+          );
+          return;
+        }
+      }
+    }
+
+    if (profile === null) {
+      throw new Error("select an exact Helm module profile before preparing its bundle");
+    }
+    setStep("step-prepare", "working", "Verifying");
+    setStatus("Downloading and verifying", "The selected bundle is authenticated before USB transfer.", "working", "Working");
+    showProgress("Downloading recovery bundle", 0, "Starting authenticated same-origin download");
+    appendLog(`Preparing trusted bundle for ${profile.id}.`);
     const bundle = await downloadAndValidate(profile);
     state.preparedBundle = bundle;
     setStep("step-prepare", "complete", "Verified");
     setStep("step-boot", "current", "Ready");
     showProgress("Recovery bundle verified", 100, `${formatBytes(bundle.totalBytes)} of signed RCM artifacts are ready in browser memory`);
-    setStatus("Bundle verified", "Put Helm in force-recovery mode, then choose its APX device.", "success", "Verified");
+    setStatus(
+      "Bundle verified",
+      state.bootromDevice === null
+        ? "Put Helm in force-recovery mode, then choose its APX device."
+        : "The detected APX device is authorized and ready for volatile RAM boot.",
+      "success",
+      "Verified",
+    );
     appendLog(`Bundle verified for ${bundle.profile.id}; USB transfer has not started.`, "ok");
   } catch (error) {
     state.preparedBundle = null;
@@ -718,27 +830,36 @@ async function handleBoot() {
   }
   const bundle = state.preparedBundle;
   const continuing = state.rcmHandoff !== null;
+  const hasAuthorizedBootrom = !continuing && state.bootromDevice !== null;
   const rcm = state.rcm ?? new T234WebUsbRcm({ usb: navigator.usb });
   state.rcm = rcm;
   state.busy = "boot";
-  setStep("step-boot", "working", continuing ? "Choose MB1" : "Choose BootROM");
+  setStep("step-boot", "working", continuing ? "Choose MB1" : (hasAuthorizedBootrom ? "Starting" : "Choose BootROM"));
   setStatus(
-    continuing ? "Choose the re-enumerated MB1 APX device" : "Choose the BootROM APX device",
-    "Each browser chooser is a physical-device trust boundary.",
+    continuing
+      ? "Choose the re-enumerated MB1 APX device"
+      : (hasAuthorizedBootrom ? "BootROM device authorized" : "Choose the BootROM APX device"),
+    hasAuthorizedBootrom
+      ? "Using the APX permission already granted during module detection."
+      : "Each browser chooser is a physical-device trust boundary.",
     "working",
-    continuing ? "USB grant 2" : "USB grant 1",
+    continuing ? "USB grant 2" : (hasAuthorizedBootrom ? "Authorized" : "USB grant 1"),
   );
-  appendLog(
-    `Requesting ${continuing ? "MB1" : "BootROM"} APX ` +
-    `0955:${bundle.profile.productId.toString(16).padStart(4, "0")} for ${bundle.profile.board}.`,
-  );
+  appendLog(hasAuthorizedBootrom
+    ? `Using authorized BootROM APX 0955:${bundle.profile.productId.toString(16).padStart(4, "0")} for ${bundle.profile.board}.`
+    : `Requesting ${continuing ? "MB1" : "BootROM"} APX ` +
+      `0955:${bundle.profile.productId.toString(16).padStart(4, "0")} for ${bundle.profile.board}.`);
   updateControls();
   try {
     if (!continuing) {
-      // Keep requestDevice as the first awaited operation in this click branch:
-      // WebUSB permission requires a live, transient user activation.
-      const device = await rcm.requestDevice(bundle);
-      appendLog(`Authorized BootROM APX 0955:${device.productId.toString(16).padStart(4, "0")}.`);
+      let device = state.bootromDevice;
+      state.bootromDevice = null;
+      if (device === null) {
+        // Keep requestDevice as the first awaited operation in this click branch:
+        // WebUSB permission requires a live, transient user activation.
+        device = await rcm.requestDevice(bundle);
+        appendLog(`Authorized BootROM APX 0955:${device.productId.toString(16).padStart(4, "0")}.`);
+      }
       setStatus("BootROM transfer in progress", "Keep power and USB connected while APX re-enumerates.", "working", "Transferring");
       const handoff = await rcm.bootrom(device, bundle, { onProgress: handleRcmProgress });
       state.rcmHandoff = handoff;
@@ -1031,7 +1152,7 @@ async function initialize() {
     renderProfileOptions();
     appendLog(`Catalog loaded with ${state.catalogProfiles.size} verified profiles.`, "ok");
     if (state.browserReady) {
-      setStatus("Ready to prepare a Helm", "Confirm that exactly one board is connected, then choose its exact module profile.", "ready", "Ready");
+      setStatus("Ready to detect Helm", "One board only. Detect APX or select manually.", "ready", "Ready");
     }
   } catch (error) {
     setFeature("catalog", false, "Invalid");

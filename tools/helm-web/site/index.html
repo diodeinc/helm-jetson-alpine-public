@@ -4,20 +4,20 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
-    <meta name="description" content="Provision a Diode Helm from desktop Chrome over one USB cable.">
+    <meta name="description" content="Flash Helm over recovery USB.">
     <meta property="og:type" content="website">
     <meta property="og:title" content="Helm Browser Flasher">
-    <meta property="og:description" content="One cable. Guarded provisioning for Diode Helm.">
+    <meta property="og:description" content="Flash Helm over recovery USB.">
     <meta property="og:url" content="https://preview.example.invalid/helm">
     <meta property="og:image" content="https://preview.example.invalid/helm/og.png">
     <meta name="twitter:card" content="summary_large_image">
-    <title>Helm Flasher</title>
+    <title>Helm</title>
     <link rel="stylesheet" href="/helm/styles.css">
     <script type="module" src="/helm/app.mjs"></script>
   </head>
   <body>
     <header class="topbar">
-      <a class="product-name" href="/helm/" aria-label="Diode Helm Provisioner">
+      <a class="product-name" href="/helm/" aria-label="Diode Helm">
         <svg class="diode-mark" viewBox="6 2 90 72" aria-hidden="true">
           <path d="M13.345 38.264h16.348" stroke-width="7.525" />
           <path d="M32.221 11.816v52.818" stroke-width="7.107" />
@@ -30,17 +30,13 @@
         </svg>
         <span>Diode</span>
         <span class="product-divider" aria-hidden="true">/</span>
-        <span class="product-scope">Helm Provisioner</span>
+        <span class="product-scope">Helm</span>
       </a>
-      <span class="preview-label">Recovery USB · Developer preview</span>
+      <span class="preview-label">Recovery USB</span>
     </header>
 
-    <main>
-      <section class="intro" aria-labelledby="page-title">
-        <h1 id="page-title">Provision Helm</h1>
-        <p>Install Alpine to NVMe and update QSPI over the recovery USB port.</p>
-      </section>
-
+    <main aria-label="Helm provisioning">
+      <div class="workflow">
       <ul class="checks" id="feature-checks" aria-label="Browser capabilities">
         <li data-feature="secure"><span class="check-dot" aria-hidden="true"></span><span>HTTPS</span><strong>Checking</strong></li>
         <li data-feature="usb"><span class="check-dot" aria-hidden="true"></span><span>WebUSB</span><strong>Checking</strong></li>
@@ -128,13 +124,13 @@
           <div class="step-heading">
             <div class="step-title">
               <span class="step-index" aria-hidden="true">01</span>
-              <h2>Select image</h2>
+              <h2>Detect module</h2>
             </div>
             <span class="step-state">Ready</span>
           </div>
-          <p class="step-copy">Choose the exact module SKU. The bundle is SHA-256 verified before USB access.</p>
+          <p class="step-copy">APX ID selects the profile. PID 7523 requires the module label.</p>
 
-          <label class="field-label" for="profile-select">Module profile</label>
+          <label class="field-label" for="profile-select">Manual profile</label>
           <select id="profile-select" disabled>
             <option value="">Loading profiles…</option>
           </select>
@@ -146,9 +142,9 @@
 
           <div class="action-row">
             <button id="prepare-button" class="button button-primary" type="button" disabled>
-              Download and verify
+              Detect Helm
             </button>
-            <span id="bundle-summary" class="action-hint">No profile selected</span>
+            <span id="bundle-summary" class="action-hint">APX not detected</span>
           </div>
         </li>
 
@@ -160,12 +156,12 @@
             </div>
             <span class="step-state">Locked</span>
           </div>
-          <p class="step-copy">Grant BootROM, then grant MB1/PSC after APX re-enumerates. This does not write NVMe or QSPI.</p>
+          <p class="step-copy">Volatile RAM boot. Grant MB1 after APX re-enumerates.</p>
           <div class="action-row">
             <button id="boot-button" class="button button-primary" type="button" disabled>
               Select BootROM APX and start
             </button>
-            <span class="action-hint">APX permissions 1 and 2 of 3</span>
+            <span class="action-hint">APX grants 1–2/3</span>
           </div>
         </li>
 
@@ -177,12 +173,12 @@
             </div>
             <span class="step-state">Locked</span>
           </div>
-          <p class="step-copy">Open Helm recovery <code>0955:7020</code> and preflight <code>/dev/nvme0n1</code>.</p>
+          <p class="step-copy">Grant recovery <code>0955:7020</code> for read-only preflight.</p>
           <div class="action-row">
             <button id="recovery-button" class="button button-primary" type="button" disabled>
               Connect and preflight
             </button>
-            <span class="action-hint">Recovery permission 3 of 3</span>
+            <span class="action-hint">Recovery grant 3/3</span>
           </div>
         </li>
 
@@ -233,14 +229,15 @@
           </div>
         </li>
       </ol>
+      </div>
 
-      <details id="session-details" class="console">
-        <summary>
-          <span>Session log</span>
+      <section id="session-details" class="console" aria-labelledby="session-log-title">
+        <header class="console-heading">
+          <span id="session-log-title">Session log</span>
           <span id="log-count">0 entries</span>
-        </summary>
+        </header>
         <pre id="session-log" tabindex="0" aria-label="Provisioning session log"></pre>
-      </details>
+      </section>
     </main>
   </body>
 </html>

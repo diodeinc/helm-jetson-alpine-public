@@ -32,16 +32,20 @@ and USB/serial Permissions Policy.
 
 The customer flow is deliberately split into four visible stages:
 
-1. Select the exact module, download its bundle, and verify every digest.
-2. Grant BootROM APX access, then grant the re-enumerated MB1/PSC APX device
-   and complete the volatile RAM boot.
+1. Grant one supported BootROM APX device. Its PID selects the unique module
+   profile when possible; shared PID `0x7523` requires an explicit SKU choice.
+   Download the selected bundle and verify every digest.
+2. Reuse that BootROM grant for stage one, then grant the re-enumerated
+   MB1/PSC APX device and complete the volatile RAM boot.
 3. Grant the re-enumerated `0955:7020` recovery console through Web Serial and
    run the target-side read-only preflight.
 4. Review the NVMe inventory fingerprint, type the exact generated phrase,
    and explicitly start the persistent NVMe/QSPI operation.
 
 It is one physical cable but three browser permission grants: BootROM WebUSB,
-MB1/PSC WebUSB, then recovery Web Serial. Nothing starts the
+MB1/PSC WebUSB after re-enumeration, then recovery Web Serial. Detection does
+not add a redundant BootROM chooser; the selected `USBDevice` is retained and
+used for the first transfer. Nothing starts the
 installer automatically. A timeout or disconnect after the install command is
 sent is reported as unknown persistent state, never as success.
 
@@ -52,33 +56,41 @@ for a network address; plain `http://192.0.2.1` is not a WebUSB-capable
 origin. `http://localhost` is the browser's development-only exception.
 `navigator.usb.requestDevice()` must run from a customer click.
 
-Validate the bundle before the click so hashing the large recovery blob does
-not consume the browser's transient user activation:
+The static application makes APX selection the first awaited operation in the
+prepare-button handler, then uses the selected PID to choose the catalog
+profile before downloading and validating it. A shortened version is:
 
 ```js
 import {
   T234WebUsbRcm,
+  profilesByProductId,
+  requestAnyApxDevice,
   validateRcmBundle,
 } from "./tools/helm-web/index.js";
 
 let bundle;
+let bootromDevice;
 let rcm;
 let handoff;
 
-bundleInput.addEventListener("change", async () => {
-  bundle = await validateRcmBundle(bundleInput.files, {
-    // Required for the shared 0x7523 PID; recommended for every profile.
-    expectedProfileId: profileSelect.value,
-    // Production should pass a digest allowlist delivered by trusted site code.
-    trustedChecksums: approvedDigests[profileSelect.value],
+prepareButton.addEventListener("click", async () => {
+  // Must be the first await while the click still has user activation.
+  bootromDevice = await requestAnyApxDevice(navigator.usb);
+  const candidates = profilesByProductId(bootromDevice.productId);
+  const profileId = candidates.length === 1
+    ? candidates[0].id
+    : await requireExplicit0003Or0005Selection();
+  const files = await downloadCatalogBundle(profileId);
+  bundle = await validateRcmBundle(files, {
+    expectedProfileId: profileId,
+    trustedChecksums: approvedDigests[profileId],
     onProgress: showHashProgress,
   });
 });
 
 bootButton.addEventListener("click", async () => {
   rcm = new T234WebUsbRcm();
-  const device = await rcm.requestDevice(bundle);
-  handoff = await rcm.bootrom(device, bundle, {
+  handoff = await rcm.bootrom(bootromDevice, bundle, {
     onProgress: showUsbProgress,
   });
 });
@@ -133,8 +145,8 @@ The implementation mirrors
 `t234-bootkit` commit `5cedc336c859a2561644475aef057feaf41e73c0` with
 `tools/helm-macos/t234-bootkit-orin-family.patch` applied:
 
-1. Select exactly `0955:<profile PID>` and claim the first interface alternate
-   with bulk IN and bulk OUT.
+1. Select one supported T234 APX PID, require it to match the validated bundle
+   profile, and claim the first interface alternate with bulk IN and bulk OUT.
 2. Read standard USB string descriptor 3, at most `0x82` bytes, for the
    BootROM CID.
 3. Send these raw signed files to bulk OUT, in order, with writes no larger
@@ -170,9 +182,12 @@ Five module profiles are supported through four distinct APX PIDs:
 | P3767-0005 Orin Nano 8GB SD | `helm-orin-nano-8gb-sd-r39.2` | `0x7523` |
 
 The browser cannot distinguish P3767-0003 from P3767-0005 by APX descriptor.
-Bundle validation therefore refuses PID `0x7523` unless the application gives
-an explicit expected profile. The target-side EEPROM guard must remain the
-authority before any persistent QSPI write.
+PIDs `0x7323`, `0x7423`, and `0x7623` each select their sole catalog profile.
+PID `0x7523` never guesses: the operator must choose P3767-0003 or P3767-0005.
+Closing the detection chooser leaves the full manual profile selector
+available. Bundle validation still refuses the shared PID unless the
+application gives an explicit expected profile, and the target-side EEPROM
+guard remains the authority before any persistent QSPI write.
 
 ## Remaining browser boundary
 
@@ -198,8 +213,10 @@ the module EEPROM, NVMe geometry, payload, QSPI backup, or full-readback guards
 inside recovery.
 
 After the destructive boundary, the page reduces to the selected device and
-profile, four session-bound target stages, elapsed time, and a collapsed raw
-log. The stages are NVMe install, QSPI backup, QSPI write, and full QSPI
+profile, four session-bound target stages, elapsed time, and an always-visible
+raw session log. On desktop the log is a sticky console on the right; narrow
+screens place it below the workflow. The stages are NVMe install, QSPI backup,
+QSPI write, and full QSPI
 readback verification. They are deliberately indeterminate: elapsed time is
 not presented as device progress, and only the validated final success marker
 may change the result to complete.
@@ -223,8 +240,9 @@ node --test \
 tools/helm-web/prepare-site.py self-test
 ```
 
-The suite covers profile/PID binding, strict manifests, incremental hashing,
-exact device filters, the serialless two-grant handoff, partial transfers, the complete six-file wire order,
+The suite covers profile/PID binding, unique and ambiguous APX detection,
+strict manifests, incremental hashing, exact and family-wide device filters,
+the serialless two-grant handoff, partial transfers, the complete six-file wire order,
 the 68-byte banner, progress, duplicate-device rejection, timeout cleanup,
 token-bound recovery markers, exact confirmation, unknown-state handling,
 static path confinement, headers, HEAD requests, and bounded byte ranges.

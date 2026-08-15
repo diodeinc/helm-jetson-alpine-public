@@ -9,6 +9,8 @@ import {
   RCM_BOOTROM_ARTIFACTS,
   SUPPORTED_PRODUCT_IDS,
   BundleValidationError,
+  profilesByProductId,
+  uniqueProfileByProductId,
   validateRcmBundle,
 } from "../bundle.js";
 import { Sha256, sha256File, sha256Hex } from "../sha256.js";
@@ -19,6 +21,7 @@ import {
   T234WebUsbRcm,
   WRITE_CHUNK_SIZE,
   parseBootloaderBanner,
+  requestAnyApxDevice,
   requestApxDevice,
   webUsbFilters,
   withTimeout,
@@ -254,6 +257,17 @@ test("profile table has five SKUs and four exact APX product IDs", () => {
     { vendorId: 0x0955, productId: 0x7423 },
   ]);
   assert.throws(() => webUsbFilters(0x7023), ApxWebUsbError);
+  assert.deepEqual(
+    [0x7323, 0x7423, 0x7623].map((productId) =>
+      uniqueProfileByProductId(productId)?.sku),
+    ["0000", "0001", "0004"],
+  );
+  assert.equal(uniqueProfileByProductId(0x7523), null);
+  assert.deepEqual(
+    profilesByProductId(0x7523).map(({ sku }) => sku),
+    ["0003", "0005"],
+  );
+  assert.deepEqual(profilesByProductId(0x7023), []);
 });
 
 test("strict bundle validation binds profile metadata and every digest", async () => {
@@ -317,6 +331,24 @@ test("device chooser uses an exact VID/PID filter and validates its result", asy
   await assert.rejects(
     requestApxDevice(new FakeUsb(wrong, [wrong]), 0x7423),
     /expected 0x0955:0x7423/,
+  );
+});
+
+test("profile detection chooser accepts every supported T234 APX PID", async () => {
+  const selected = new FakeDevice(0x7623);
+  const usb = new FakeUsb(selected, [selected]);
+  assert.equal(await requestAnyApxDevice(usb), selected);
+  assert.deepEqual(usb.request, {
+    filters: SUPPORTED_PRODUCT_IDS.map((productId) => ({
+      vendorId: 0x0955,
+      productId,
+    })),
+  });
+
+  const unsupported = new FakeDevice(0x7023);
+  await assert.rejects(
+    requestAnyApxDevice(new FakeUsb(unsupported, [unsupported])),
+    /expected a supported 0x0955 T234 APX device/,
   );
 });
 

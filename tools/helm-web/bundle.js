@@ -86,6 +86,11 @@ export const SUPPORTED_PRODUCT_IDS = Object.freeze(
 );
 
 const PROFILES_BY_ID = new Map(PROFILE_DEFINITIONS.map((entry) => [entry.id, entry]));
+const PROFILES_BY_PRODUCT_ID = new Map(SUPPORTED_PRODUCT_IDS.map((productId) => [
+  productId,
+  Object.freeze(PROFILE_DEFINITIONS.filter((entry) => entry.productId === productId)),
+]));
+const NO_PROFILES = Object.freeze([]);
 const PROFILE_KEYS = Object.freeze([
   "PROFILE",
   "BSP_RELEASE",
@@ -287,6 +292,15 @@ export function profileById(profileId) {
     throw new BundleValidationError(`unsupported Helm profile: ${profileId}`);
   }
   return definition;
+}
+
+export function profilesByProductId(productId) {
+  return PROFILES_BY_PRODUCT_ID.get(productId) ?? NO_PROFILES;
+}
+
+export function uniqueProfileByProductId(productId) {
+  const profiles = profilesByProductId(productId);
+  return profiles.length === 1 ? profiles[0] : null;
 }
 
 export function isValidatedRcmBundle(value) {
