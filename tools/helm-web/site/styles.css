@@ -220,6 +220,16 @@ main {
   margin: 3px 0 0;
 }
 
+.alert-preview {
+  background: var(--warning-soft);
+  border-color: var(--warning-line);
+  color: var(--warning);
+}
+
+.alert-preview p {
+  color: var(--ink);
+}
+
 .status-panel {
   align-items: center;
   display: flex;

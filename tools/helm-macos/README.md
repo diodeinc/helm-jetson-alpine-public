@@ -36,6 +36,12 @@ validated source pin is `5cedc336c859a2561644475aef057feaf41e73c0`; the
 tracked family patch is applied only to a build-directory copy, so an arbitrary
 or dirty sibling checkout cannot alter the loader that is compiled.
 
+The loader repository is currently internal to Diode. Complete builds also
+need the qualified seed catalog described below, which is not distributed
+here and has no public generation procedure yet. Source publication does not
+make those inputs publicly available. Use separately authorized inputs;
+synthetic source tests can run without the loader or firmware archives.
+
 ## Module profiles and exact-SKU inputs
 
 `helm-macos profiles` lists the five supported configurations:

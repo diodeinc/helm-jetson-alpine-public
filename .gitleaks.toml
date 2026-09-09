@@ -1,0 +1,18 @@
+title = "Helm public source secret checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Fixed synthetic session values in the console self-test"
+  condition = "AND"
+  paths = ['''^tools/helm-macos/helm-provision-console\.py$''']
+  regexTarget = "line"
+  regexes = [
+    '''^\s*token = "0123456789abcdef0123456789abcdef"\s*$''',
+    '''^\s*install_token = "fedcba9876543210fedcba9876543210"\s*$''',
+    '''^\s*"success", token, "helm-orin-nx-8gb-r39\.2", "/dev/nvme0n1"\s*$''',
+  ]

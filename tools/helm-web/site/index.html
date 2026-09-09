@@ -4,13 +4,10 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
-    <meta name="description" content="Flash Helm over recovery USB.">
+    <meta name="description" content="Developer preview for flashing Helm over recovery USB on a controlled bench.">
     <meta property="og:type" content="website">
     <meta property="og:title" content="Helm Browser Flasher">
-    <meta property="og:description" content="Flash Helm over recovery USB.">
-    <meta property="og:url" content="https://preview.example.invalid/helm">
-    <meta property="og:image" content="https://preview.example.invalid/helm/og.png">
-    <meta name="twitter:card" content="summary_large_image">
+    <meta property="og:description" content="Developer preview for flashing Helm over recovery USB on a controlled bench.">
     <title>Helm</title>
     <link rel="stylesheet" href="/helm/styles.css">
     <script type="module" src="/helm/app.mjs"></script>
@@ -37,6 +34,11 @@
 
     <main aria-label="Helm provisioning">
       <div class="workflow">
+      <aside class="alert alert-preview" aria-label="Developer preview limitations">
+        <strong>Developer preview · controlled bench use</strong>
+        <p>Only P3767-0001 has completed the browser flow on hardware. Other SKUs and broader browser/host combinations remain unqualified. Installation erases NVMe and rewrites QSPI boot firmware.</p>
+      </aside>
+
       <ul class="checks" id="feature-checks" aria-label="Browser capabilities">
         <li data-feature="secure"><span class="check-dot" aria-hidden="true"></span><span>HTTPS</span><strong>Checking</strong></li>
         <li data-feature="usb"><span class="check-dot" aria-hidden="true"></span><span>WebUSB</span><strong>Checking</strong></li>

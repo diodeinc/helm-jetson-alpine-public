@@ -7,15 +7,27 @@ application then uses Web Serial to run the existing guarded read-only
 preflight and, only after an exact typed phrase, the target-side NVMe/QSPI
 provisioner.
 
-The tailnet-only developer preview is hosted at
-<https://preview.example.invalid/helm>. A public customer release
-needs a dedicated public HTTPS origin such as `flash.diode.com`; the raw
-`192.0.2.1` address cannot present the certificate needed for WebUSB.
+This is a developer preview for controlled bench use. The complete browser
+flow has been exercised physically on P3767-0001, including the two-grant
+BootROM-to-MB1 handoff and verified NVMe/QSPI provisioning. Other SKUs and
+broader browser/host combinations remain unqualified. Installation erases
+NVMe and rewrites QSPI boot firmware.
+
+Run locally using the instructions below, or serve the generated site from a
+trusted HTTPS origin. Publishing this source does not publish a hosted flasher
+or include its firmware bundles.
 
 ## Build and run the site
 
-Build all five native recovery bundles first, then validate every bundle and
-prepare the static site:
+Building the recovery bundles requires Apple-silicon macOS, access to the
+separate `diodeinc/t234-bootkit` repository, NVIDIA's R39.2 BSP, and the qualified
+P3767-0001 signed seed catalog. The seed catalog and generated firmware bundles
+are excluded from this repository; a public clone alone is not a complete
+firmware build input set. Follow the [native build instructions](../helm-macos/README.md)
+to supply those inputs.
+
+Build all five native recovery bundles, then validate every bundle and prepare
+the static site:
 
 ```sh
 ./tools/helm-macos/helm-macos family-matrix
@@ -52,8 +64,8 @@ sent is reported as unknown persistent state, never as success.
 ## Browser contract
 
 WebUSB requires a supported Chromium browser and a secure context. Use HTTPS
-for a network address; plain `http://192.0.2.1` is not a WebUSB-capable
-origin. `http://localhost` is the browser's development-only exception.
+for network access. Local development can use `http://localhost` or
+`http://127.0.0.1`.
 `navigator.usb.requestDevice()` must run from a customer click.
 
 The static application makes APX selection the first awaited operation in the
@@ -138,6 +150,27 @@ const trustedChecksums = {
 
 Do not add `SHA256SUMS` to that object. The trusted values anchor the bundle;
 the locally supplied checksum file must independently agree with them.
+
+The included static application takes these trusted digests from
+`catalog.json` on the same origin as the page. There is no independent release
+signature verification. The checks detect corruption or a payload that differs
+from the catalog; replacing both the catalog and payload can pass them. Trust
+therefore depends on the reviewed build inputs and control of the HTTPS origin
+and deployment credentials. A compromised frontend could also change the
+verification or install flow.
+
+## Public rollout prerequisites
+
+- Record physical qualification for every advertised SKU and browser/host
+  combination, including provisioning, cold boot, and recovery after failures.
+- Use a dedicated trusted HTTPS origin, preserve the server's security headers,
+  and restrict who can build and deploy releases.
+- Publish reviewed release artifacts with recorded checksums and source
+  revisions. Confirm redistribution rights for the NVIDIA inputs and generated
+  firmware before making bundles public.
+- Replace the bring-up image's bench console access and configure device
+  credentials before using installed devices outside a controlled bench. See
+  the [repository security notes](../../README.md#security).
 
 ## Exact transfer sequence
 
@@ -248,5 +281,7 @@ token-bound recovery markers, exact confirmation, unknown-state handling,
 static path confinement, headers, HEAD requests, and bounded byte ranges.
 
 The WebUSB protocol and generated bundles are source- and simulation-verified.
-The two-grant BootROM-to-MB1 flow still needs physical qualification in desktop
-Chrome on every supported host/platform combination.
+The complete browser flow has also passed on a physical P3767-0001, including
+the two-grant BootROM-to-MB1 handoff and verified NVMe/QSPI provisioning.
+These tests do not establish physical qualification for the other four SKUs
+or broader browser/host combinations.

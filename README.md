@@ -1,6 +1,13 @@
 # Helm Jetson Alpine
 
-[![Native macOS CI](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml/badge.svg)](https://github.com/diodeinc/helm-jetson-alpine/actions/workflows/ci.yml)
+[![Native macOS CI](https://github.com/diodeinc/helm-jetson-alpine-public/actions/workflows/ci.yml/badge.svg)](https://github.com/diodeinc/helm-jetson-alpine-public/actions/workflows/ci.yml)
+
+> **Experimental bring-up software for a controlled bench.** Installation
+> erases the selected NVMe and rewrites QSPI boot firmware. Only P3767-0001
+> has completed physical qualification; the other four SKUs have structural
+> checks only. Installed images provide passwordless root on the debug UART,
+> and recovery provides root over UART and USB. Back up data and use hardware
+> you can recover. See [Security](SECURITY.md) before using an image.
 
 A small Alpine Linux appliance OS for the Diode Helm carrier and the complete
 Jetson Orin NX/Nano P3767 module family supported by Helm. The image combines
@@ -51,8 +58,8 @@ Rosetta, or NVIDIA Linux host executable.
   selected profile from being used on a different module SKU.
 - A dependency-free browser flasher verifies and RAM-boots the same bundles
   through WebUSB, then drives the guarded recovery preflight/install protocol
-  through Web Serial. It is a developer preview pending physical browser
-  qualification; the native macOS path remains the qualified path.
+  through Web Serial. P3767-0001 has completed the browser flow physically;
+  broader browser/host and exact-SKU qualification is still pending.
 
 All five per-SKU catalogs, QSPI images, and recovery bundles are structurally
 verified on macOS. P3767-0001 additionally reproduces the qualified recovery
@@ -75,6 +82,13 @@ Requirements:
 - NVIDIA `Jetson_Linux_R39.2.0_aarch64.tbz2`
 - access to [`diodeinc/t234-bootkit`](https://github.com/diodeinc/t234-bootkit)
 - the qualified, unfused P3767-0001 R39.2 signed seed catalog
+
+**Build availability:** `t234-bootkit` is currently internal to Diode, and the
+qualified seed is not distributed in this repository. A public checkout can
+run source checks and synthetic tests, but cannot build the complete recovery
+bundle without separately authorized access to those inputs. No public seed
+download or standalone seed-generation procedure is provided yet. Do not use
+a different module's firmware to work around missing inputs.
 
 Install host tools:
 
@@ -115,7 +129,7 @@ and the bundle contract.
 
 ## RAM boot and target-side install
 
-For the customer path, connect one supported Helm directly to the Mac through
+For guided bench provisioning, connect one supported Helm directly to the Mac through
 its recovery USB port, put it in force recovery, and run one guarded command:
 
 ```sh
@@ -158,10 +172,10 @@ profile=helm-orin-nx-8gb-r39.2
 
 ## Browser flasher preview
 
-The tailnet-only browser prototype is available in current desktop Chrome or
-Chromium at
-<https://preview.example.invalid/helm>. Connect exactly one Helm,
-keep it powered, and use its recovery USB port. It is still one physical cable,
+The browser prototype runs in current desktop Chrome or Chromium. See the
+[local setup instructions](tools/helm-web/README.md#build-and-run-the-site);
+no public hosted flasher is provided here. Connect exactly one Helm, keep it
+powered, and use its recovery USB port. It is still one physical cable,
 but the browser asks for BootROM WebUSB access, MB1/PSC WebUSB access after APX
 re-enumerates, and finally the recovery Web Serial port. The first chooser also
 detects the module profile for the three unambiguous APX product IDs and reuses
@@ -177,9 +191,9 @@ choice because both use PID `0955:7523`.
 The complete browser flow has been exercised physically on P3767-0001, including
 the two-grant T234 BootROM-to-MB1 handoff and verified NVMe/QSPI provisioning.
 It remains a developer preview until it has broader Chrome/macOS and exact-SKU
-qualification. A public rollout also needs its own trusted origin (for example
-`flash.diode.com`); the current host is private to the tailnet, and the raw
-`192.0.2.1` URL is not a valid WebUSB HTTPS origin.
+qualification. A public rollout also needs a dedicated, trusted HTTPS origin
+and reviewed firmware-distribution terms. Plain HTTP on a network address is
+not a valid WebUSB secure context; localhost is available for development.
 
 For manual recovery or diagnosis, the underlying non-writing steps remain:
 
@@ -201,8 +215,8 @@ helm-install inspect
 helm-install install --device /dev/nvme0n1 --confirm /dev/nvme0n1
 ```
 
-The second command destroys that NVMe. It refuses non-NVMe paths, mounted
-targets, devices below 2 GiB, and confirmation text that does not exactly
+The second command destroys that NVMe. It refuses non-NVMe paths, directly
+mounted targets, devices below 2 GiB, and confirmation text that does not exactly
 match the selected whole disk. It creates GPT entry 1 as the ext4 `APP` /
 `HELM_ROOT` filesystem and GPT entry 2 as a 64 MiB FAT `esp` / `HELM_ESP`,
 extracts the verified OS archive, and installs the UEFI fallback launcher. It
@@ -249,3 +263,8 @@ The bring-up image enables passwordless root on the physical debug UART.
 Dropbear is key-only and has no usable remote login unless an authorized key
 is injected at build time. Remove the UART bypass and provision unique
 credentials before deploying outside a controlled bench.
+
+See [SECURITY.md](SECURITY.md) for the threat model and vulnerability reporting,
+[THIRD_PARTY.md](THIRD_PARTY.md) for component licensing boundaries, and the
+[publication checklist](docs/public-release.md) before publishing source or
+distributing firmware.

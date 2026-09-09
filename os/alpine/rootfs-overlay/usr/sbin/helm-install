@@ -233,11 +233,40 @@ configure_installed_boot()
 	}
 }
 
+read_archive_with_tar()
+(
+	archive_status_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-archive.XXXXXX") || \
+		die "cannot create archive status directory"
+	trap 'rm -rf "$archive_status_dir"' EXIT
+	trap 'exit 1' HUP INT TERM
+	# POSIX sh only reports the final pipeline status. Record zstd success in
+	# a private directory, and keep consuming after tar's end-of-archive marker
+	# so an otherwise valid stream cannot fail with a premature broken pipe.
+	# The producer closes its pipe only after recording success.
+	if (
+		zstd -q -d -c "$archive" || exit 1
+		: > "$archive_status_dir/decompressed"
+	) | {
+		tar_status=0
+		tar "$@" -f - || tar_status=$?
+		cat >/dev/null || exit 1
+		exit "$tar_status"
+	}
+	then
+		[ -f "$archive_status_dir/decompressed" ] || \
+			die "rootfs archive decompression failed: $archive"
+	else
+		die "could not read rootfs archive with tar: $archive"
+	fi
+)
+
 validate_archive()
 {
 	[ -s "$archive" ] || die "rootfs archive is missing or empty: $archive"
 	command -v zstd >/dev/null 2>&1 || die "zstd is unavailable"
-	archive_listing=$(zstd -q -d -c "$archive" | tar -tf -)
+	zstd -q -t "$archive" || die "rootfs archive integrity check failed: $archive"
+	archive_listing=$(read_archive_with_tar -t) || \
+		die "could not list rootfs archive: $archive"
 	printf '%s\n' "$archive_listing" | grep -qx './sbin/init' || \
 		die "archive has no /sbin/init"
 	printf '%s\n' "$archive_listing" | grep -qx './boot/Image' || \
@@ -248,6 +277,43 @@ validate_archive()
 		die "archive has no selected P3767-$board_sku DTB: $boot_dtb"
 	printf '%s\n' "$archive_listing" | grep -qx './usr/lib/helm/BOOTAA64.EFI' || \
 		die "archive has no NVIDIA UEFI OS launcher"
+}
+
+archive_self_test()
+{
+	command -v zstd >/dev/null 2>&1 || die "self-test requires zstd"
+	mkdir -p "$test_dir/root/sbin" "$test_dir/root/usr/lib/helm"
+	printf 'test-init\n' > "$test_dir/root/sbin/init"
+	printf 'test-kernel\n' > "$test_dir/root/boot/Image"
+	printf 'test-launcher\n' > "$test_dir/root/usr/lib/helm/BOOTAA64.EFI"
+	tar -cf "$test_dir/rootfs.tar" -C "$test_dir/root" .
+	# Put the frame checksum beyond tar's end marker. A pipeline that checks
+	# only tar's exit status can accept these corrupt/truncated streams.
+	dd if=/dev/zero bs=1024 count=256 >> "$test_dir/rootfs.tar" 2>/dev/null
+	archive=$test_dir/rootfs.tar.zst
+	zstd -q --check "$test_dir/rootfs.tar" -o "$archive"
+	validate_archive
+	mkdir -p "$test_dir/extracted"
+	read_archive_with_tar -xp -C "$test_dir/extracted"
+	cmp "$test_dir/root/boot/Image" "$test_dir/extracted/boot/Image"
+	cmp "$test_dir/root/sbin/init" "$test_dir/extracted/sbin/init"
+	if (read_archive_with_tar -xp -C "$test_dir/absent") >/dev/null 2>&1; then
+		die "self-test accepted tar extraction failure"
+	fi
+
+	archive_bytes=$(wc -c < "$archive" | tr -d ' ')
+	dd if="$archive" of="$test_dir/truncated.tar.zst" \
+		bs=1 count=$((archive_bytes - 1)) 2>/dev/null
+	cp "$archive" "$test_dir/corrupt.tar.zst"
+	printf '\001' >> "$test_dir/corrupt.tar.zst"
+	for archive in "$test_dir/truncated.tar.zst" "$test_dir/corrupt.tar.zst"; do
+		if (validate_archive) >/dev/null 2>&1; then
+			die "self-test accepted damaged archive during validation"
+		fi
+		if (read_archive_with_tar -xp -C "$test_dir/extracted") >/dev/null 2>&1; then
+			die "self-test ignored decompression failure during extraction"
+		fi
+	done
 }
 
 self_test()
@@ -270,10 +336,14 @@ self_test()
 		[ "$boot_dtb" = "$expected_dtb_name" ]
 		[ "$expected_profile" = "$expected_profile_id" ]
 	done
-	! select_boot_profile 0002
+	if select_boot_profile 0002; then
+		die "self-test accepted an unsupported boot profile"
+	fi
 	module_matches_sku '699-13767-0001-300' 0001
 	module_matches_sku '699-13767-0005-500' 0005
-	! module_matches_sku '699-13767-0005-500' 0003
+	if module_matches_sku '699-13767-0005-500' 0003; then
+		die "self-test accepted a mismatched module SKU"
+	fi
 
 	test_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-install.XXXXXX")
 	trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
@@ -326,9 +396,10 @@ self_test()
 	then
 		return 1
 	fi
+	archive_self_test
 	rm -rf "$test_dir"
 	trap - EXIT HUP INT TERM
-	printf '%s: SKU boot-selection guards passed\n' "$program"
+	printf '%s: SKU boot-selection and archive-integrity guards passed\n' "$program"
 }
 
 canonical_nvme()
@@ -494,7 +565,7 @@ mount -t ext4 -o rw,noatime "$root_partition" "$root_mount_dir"
 root_mounted=1
 
 printf 'Extracting Helm Alpine to %s...\n' "$root_partition"
-zstd -q -d -c "$archive" | tar -xpf - -C "$root_mount_dir"
+read_archive_with_tar -xp -C "$root_mount_dir"
 [ -e "$root_mount_dir/sbin/init" ] || die "installed /sbin/init is missing"
 [ -s "$root_mount_dir/boot/Image" ] || die "installed kernel is missing"
 [ -s "$root_mount_dir/boot/extlinux/extlinux.conf" ] || \
