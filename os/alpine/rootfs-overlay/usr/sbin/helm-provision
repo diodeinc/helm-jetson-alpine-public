@@ -75,7 +75,7 @@ profile_supported()
 device_supported()
 {
 	case "$1" in
-		/dev/nvme[0-9]n[0-9]) return 0 ;;
+		/dev/nvme[0123456789]n[0123456789]) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -84,7 +84,7 @@ session_supported()
 {
 	[ "${#1}" -eq 32 ] || return 1
 	case "$1" in
-		*[!0-9a-f]*) return 1 ;;
+		*[!0123456789abcdef]*) return 1 ;;
 		*) return 0 ;;
 	esac
 }
@@ -101,7 +101,7 @@ inventory_supported()
 {
 	[ "${#1}" -eq 64 ] || return 1
 	case "$1" in
-		*[!0-9a-f]*) return 1 ;;
+		*[!0123456789abcdef]*) return 1 ;;
 		*) return 0 ;;
 	esac
 }
@@ -138,7 +138,7 @@ inventory_fingerprint_for_device()
 	serial=$(tr -d '\000\r\n' < "/sys/class/block/$base/device/serial")
 	wwid=$(tr -d '\000\r\n' < "/sys/class/block/$base/wwid")
 	case "$size" in
-		''|*[!0-9]*) die "NVMe size is invalid for inventory binding: $target" ;;
+		''|*[!0123456789]*) die "NVMe size is invalid for inventory binding: $target" ;;
 	esac
 	for identity_value in "$model" "$serial" "$wwid"; do
 		case "$identity_value" in
@@ -214,9 +214,18 @@ self_test()
 	device_supported /dev/nvme9n8
 	! device_supported /dev/nvme0n1p1
 	! device_supported /dev/sda
-	session_supported 0123456789abcdef0123456789abcdef
-	! session_supported 0123456789ABCDEF0123456789ABCDEF
-	! session_supported 0123456789abcdef
+	valid_test_session=0123456789abcdef0123456789abcdef
+	session_supported "$valid_test_session"
+	for invalid_test_session in \
+		0123456789ABCDEF0123456789ABCDEF \
+		0123456789abcdef \
+		"${valid_test_session%?}A" \
+		"${valid_test_session%?}á"
+	do
+		if session_supported "$invalid_test_session"; then
+			die "self-test accepted an invalid session"
+		fi
+	done
 	session=0123456789abcdef0123456789abcdef
 	[ "$(emit_nvme_progress)" = \
 		"HELM_PROVISION_PROGRESS session=$session step=1 phase=nvme-install" ]
@@ -227,11 +236,18 @@ self_test()
 	then
 		return 1
 	fi
-	inventory_supported \
-		0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-	! inventory_supported 0123456789abcdef
-	! inventory_supported \
-		0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+	valid_test_inventory=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+	inventory_supported "$valid_test_inventory"
+	for invalid_test_inventory in \
+		0123456789abcdef \
+		0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF \
+		"${valid_test_inventory%?}A" \
+		"${valid_test_inventory%?}á"
+	do
+		if inventory_supported "$invalid_test_inventory"; then
+			die "self-test accepted an invalid inventory fingerprint"
+		fi
+	done
 	first_inventory=$(inventory_fingerprint_from_fields \
 		helm-orin-nx-8gb-r39.2 /dev/nvme0n1 976773168 PNY-CS2142 serial-a \
 		nvme.1987-serial-a-PNY-CS2142-00000001)

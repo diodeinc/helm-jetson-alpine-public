@@ -8,7 +8,7 @@ decisions below are complete.
 
 1. Choose and add the license for Diode-owned code. Review
    [component licensing](../THIRD_PARTY.md), including the existing GPL overlay,
-   loader patch, and retained NVIDIA version metadata.
+   vendored loader source and patch, and retained NVIDIA version metadata.
 2. Run CI and the local source/secret checks. Inspect any findings rather than
    globally disabling a detector. Never add signing keys, device dumps,
    authorized-key files, firmware archives, or local credentials to Git.
@@ -33,8 +33,10 @@ decisions below are complete.
    the public repository, and verify the reporting route in
    [SECURITY.md](../SECURITY.md). Require approval for Actions runs from outside
    contributors before executing their workflow changes.
-8. Keep the experimental warning and private build prerequisites visible.
-   Source access alone does not provide the internal native loader or seed.
+8. Keep the experimental warning and missing build prerequisites visible.
+   The native loader source is included. Firmware is acquired from NVIDIA's
+   public downloads, and generating its verified seed requires the documented
+   offline Linux-container step.
 
 GitHub documents the effects of
 [changing visibility](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility)

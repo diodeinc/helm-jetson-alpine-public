@@ -9,11 +9,14 @@ third-party material or certify a generated firmware image for redistribution.
   license designation and apply its terms when distributing the overlay or
   derived device trees. The [GPL version 2 text](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
   is available from the Free Software Foundation.
-- `tools/helm-macos/t234-bootkit-orin-family.patch` targets the separately
-  versioned `diodeinc/t234-bootkit` source. Confirm the applicable source
-  license before redistributing the patch together with that source or a
-  built loader. Access to the internal repository is not a redistribution
-  license.
+- `tools/helm-macos/vendor/t234-bootkit/` contains six source files from
+  `diodeinc/t234-bootkit` at `5cedc336c859a2561644475aef057feaf41e73c0`.
+  `tools/helm-macos/t234-bootkit-orin-family.patch` is applied during builds.
+  The upstream snapshot has no license file or per-file license notices;
+  copying it here does not establish a source license. Its
+  [provenance note](tools/helm-macos/vendor/t234-bootkit/README.md) records the
+  upstream description of the USB implementation. Resolve the source license
+  and preserve applicable attribution before distributing source or binaries.
 - `tools/helm-macos/profile-data/` retains NVIDIA-derived version metadata.
   Review its provenance and applicable terms as part of a source release.
 - Existing copyright and license notices take precedence for the files they

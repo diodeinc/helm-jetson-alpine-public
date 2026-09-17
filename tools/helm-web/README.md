@@ -19,12 +19,12 @@ or include its firmware bundles.
 
 ## Build and run the site
 
-Building the recovery bundles requires Apple-silicon macOS, access to the
-separate `diodeinc/t234-bootkit` repository, NVIDIA's R39.2 BSP, and the qualified
-P3767-0001 signed seed catalog. The seed catalog and generated firmware bundles
-are excluded from this repository; a public clone alone is not a complete
-firmware build input set. Follow the [native build instructions](../helm-macos/README.md)
-to supply those inputs.
+Building the recovery bundles requires Apple-silicon macOS, NVIDIA's R39.2 BSP,
+and a verified P3767-0001 signed seed catalog. The pinned native loader and
+build helpers are included in this repository. The seed can be regenerated
+from the public NVIDIA BSP using the separate Docker generation step. Follow
+the [native build instructions](../helm-macos/README.md) first; firmware
+downloads and generated bundles remain outside Git.
 
 Build all five native recovery bundles, then validate every bundle and prepare
 the static site:

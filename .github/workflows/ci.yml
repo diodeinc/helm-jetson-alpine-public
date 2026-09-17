@@ -99,9 +99,14 @@ jobs:
           done
           python3 -m py_compile \
             tools/helm-macos/build-r39-family-inputs.py \
+            tools/helm-macos/generate-r39-seed.py \
             tools/helm-macos/build-rcm-blob.py \
             tools/helm-macos/helm-provision-console.py \
             tools/helm-macos/mkbootimg.py \
+            tools/helm-macos/vendor/t234-bootkit/macos-rcm/scripts/build-bch.py \
+            tools/helm-macos/vendor/t234-bootkit/macos-rcm/scripts/apply-bct-delta.py \
+            tools/helm-macos/vendor/t234-bootkit/tools/import-nvidia-flash-index.py \
+            tools/helm-macos/vendor/t234-bootkit/tools/qspi-flash.py \
             tools/helm-web/prepare-site.py
           node --test \
             tools/helm-web/test/rcm.test.mjs \
@@ -111,9 +116,11 @@ jobs:
           node --check tools/helm-web/server.mjs
           tools/helm-web/prepare-site.py self-test
           tools/helm-macos/build-r39-family-inputs.py --self-test
+          tools/helm-macos/generate-r39-seed.py --help >/dev/null
           tools/helm-macos/build-rcm-blob.py --self-test
           tools/helm-macos/helm-provision-console.py --self-test
-          tools/helm-macos/helm-macos self-test
+          LC_ALL=C tools/helm-macos/helm-macos self-test
+          LC_ALL=en_US.UTF-8 tools/helm-macos/helm-macos self-test
           if helm_non_tty_output=$(./helm </dev/null 2>&1); then
             echo "zero-argument helm accepted non-terminal execution" >&2
             exit 1
@@ -124,9 +131,11 @@ jobs:
           os/alpine/rootfs-overlay/usr/sbin/helm-install --help >/dev/null
           os/alpine/rootfs-overlay/usr/sbin/helm-install self-test
           os/alpine/rootfs-overlay/usr/sbin/helm-provision --help >/dev/null
-          os/alpine/rootfs-overlay/usr/sbin/helm-provision self-test
+          LC_ALL=C os/alpine/rootfs-overlay/usr/sbin/helm-provision self-test
+          LC_ALL=en_US.UTF-8 os/alpine/rootfs-overlay/usr/sbin/helm-provision self-test
           os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install --help >/dev/null
-          os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install self-test
+          LC_ALL=C os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install self-test
+          LC_ALL=en_US.UTF-8 os/alpine/rootfs-overlay/usr/sbin/helm-qspi-install self-test
           test "$(shasum tools/helm-macos/profile-data/r39.2/helm-orin-nx-8gb-r39.2/qspi_bootblob_ver.txt \
             | awk '{print $1}')" = \
             91272c6e6bda545bb804856a093eb57168cda3ca
@@ -151,6 +160,15 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Build vendored native recovery loader
+        run: |
+          unset HELM_T234_BOOTKIT_DIR
+          tools/helm-macos/helm-macos bootstrap
+          loader=build/helm-macos/work/t234-bootkit/macos-rcm/jetson-rcm
+          "$loader" --help >/dev/null
+          "$loader" products
+          file "$loader" | grep -q 'Mach-O 64-bit executable arm64'
 
       - name: Test native Android boot-image builder
         run: |

@@ -61,7 +61,9 @@ provision_initramfs=$build_dir/helm-provisioning-p3767-$profile_sku-initramfs.gz
 provision_boot=$build_dir/helm-provisioning-p3767-$profile_sku-boot.img
 stage_dir=$build_dir/work/rcm-stage-p3767-$profile_sku
 profile_data_dir=$script_dir/profile-data/r39.2/$profile_id
-bootkit_dir=${HELM_T234_BOOTKIT_DIR:-"$repo_dir/../t234-bootkit"}
+bootkit_dir=${HELM_T234_BOOTKIT_DIR:-}
+bootkit_vendor_dir=$script_dir/vendor/t234-bootkit
+bootkit_manifest=$bootkit_vendor_dir/SHA256SUMS
 bootkit_commit=5cedc336c859a2561644475aef057feaf41e73c0
 bootkit_patch=$script_dir/t234-bootkit-orin-family.patch
 bootkit_work_dir=$build_dir/work/t234-bootkit
@@ -79,6 +81,7 @@ bootloader_deb_sha256=01ef88369674ab5b9dd0dca6378e19012b594b4b3b95f2378b2d191ee0
 family_capsule_sha256=6b105ccfa982f76c3b235d4b348fbb52a0a59936136db722c14a47ca6a2d0185
 family_bup_sha256=ee84d87dc76b5e8f6d007cffee7b1c48d5b86476397e7ee6c4a2b63519816b01
 seed_flash_index_sha256=d6cbc5ab52375bdc917062c88840a411a0e1eb195b466be119df24209c8b1727
+seed_flash_layout_sha256=c923c06f9e4fbe7bde3c52fa59b93ab15bcf7dfa2f8c5f6dff5c80d7ec9f068d
 
 usage()
 {
@@ -88,7 +91,7 @@ usage: $0 [--profile PROFILE] COMMAND
 Native Apple-silicon macOS commands:
   profiles    list supported Helm Orin NX/Nano module profiles
   doctor      check host tools, fixed-profile inputs, and APX presence
-  bootstrap   clone and build the pinned native t234-bootkit loader
+  bootstrap   verify and build the vendored native t234-bootkit loader
   build       build APX tools, Alpine, recovery initramfs, and boot image
   prepare     derive this SKU's inputs from NVIDIA's pinned multi-spec BUP
   prepare-all derive inputs for all five Helm-compatible P3767 SKUs
@@ -103,13 +106,15 @@ Native Apple-silicon macOS commands:
   boot        volatile RAM-boot the recovery installer (does not write storage)
   provision   guided one-command recovery, NVMe, and QSPI provisioning over USB
   install-help show the guarded command to run on the Jetson recovery console
-  self-test   run source-only guided-command safety tests
+  self-test   run source-only source-integrity and guided-command safety tests
 
 The default profile for non-guided commands is helm-orin-nx-8gb-r39.2; guided
 provisioning derives it from the sole attached APX device. No command here runs
 Docker, a VM, or an NVIDIA host executable. Direct catalogs come from
 HELM_R39_SIGNED_DIR; family preparation derives fixed per-SKU catalogs from
 NVIDIA's official multi-spec BUP and HELM_R39_SEED_SIGNED_DIR.
+HELM_T234_BOOTKIT_DIR optionally selects a Git checkout containing the pinned
+source commit; the default native loader sources are included in this repository.
 EOF
 }
 
@@ -158,15 +163,16 @@ require_interactive_tty()
 valid_nvme_device()
 {
 	case "$1" in
-		/dev/nvme[0-9]n[0-9]) return 0 ;;
+		/dev/nvme[0123456789]n[0123456789]) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
 valid_usb_location()
 {
+	# Explicit ASCII sets keep locale collation from accepting uppercase or accents.
 	case "$1" in
-		0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) \
+		0x[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) \
 			return 0 ;;
 		*) return 1 ;;
 	esac
@@ -321,15 +327,75 @@ helm_macos_self_test()
 	profiles_for_usb_pid 0x7523 | grep -qx helm-orin-nano-8gb-sd-r39.2
 	valid_nvme_device /dev/nvme0n1
 	valid_nvme_device /dev/nvme9n8
-	! valid_nvme_device /dev/nvme0n1p1
-	! valid_nvme_device /dev/nvme00n1
-	! valid_nvme_device /dev/sda
+	for invalid_device in /dev/nvme0n1p1 /dev/nvme00n1 /dev/sda; do
+		if valid_nvme_device "$invalid_device"; then
+			die "self-test accepted an invalid NVMe device"
+		fi
+	done
 	valid_usb_location 0x01230000
-	! valid_usb_location 0x0123000
-	! valid_usb_location 0x0123000A
-	! valid_usb_location 01230000
-	printf 'helm-macos: guided-command safety tests passed\n'
+	for invalid_location in 0x0123000 0x0123000A 0x0123000á 01230000; do
+		if valid_usb_location "$invalid_location"; then
+			die "self-test accepted an invalid USB location"
+		fi
+	done
+	bootkit_sources_self_test
+	family_marker_self_test
+	printf 'helm-macos: source-integrity, family-marker and guided-command safety tests passed\n'
 }
+
+validate_seed_marker()
+{
+	awk -F '=' -v legacy="$seed_flash_index_sha256" \
+		-v layout="$seed_flash_layout_sha256" '
+		$1 == "SEED_FLASH_INDEX_SHA256" {
+			index_count++
+			index_digest = $2
+			if (NF != 2 || length($2) != 64 || $2 ~ /[^0123456789abcdef]/) bad = 1
+		}
+		$1 == "SEED_FLASH_LAYOUT_SHA256" {
+			layout_count++
+			if (NF != 2 || $2 != layout) bad = 1
+		}
+		END {
+			if (bad || index_count != 1 || layout_count > 1) exit 1
+			if (layout_count == 0 && index_digest != legacy) exit 1
+		}
+	' "$1"
+}
+
+family_marker_self_test()
+(
+	marker_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-marker-test.XXXXXX")
+	trap 'rm -rf "$marker_test_dir"' EXIT HUP INT TERM
+	marker_test_file=$marker_test_dir/marker
+	printf 'SEED_FLASH_INDEX_SHA256=%s\n' "$seed_flash_index_sha256" \
+		> "$marker_test_file"
+	validate_seed_marker "$marker_test_file" || die "self-test rejected legacy seed marker"
+	marker_test_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+	printf 'SEED_FLASH_INDEX_SHA256=%s\nSEED_FLASH_LAYOUT_SHA256=%s\n' \
+		"$marker_test_digest" "$seed_flash_layout_sha256" > "$marker_test_file"
+	validate_seed_marker "$marker_test_file" || die "self-test rejected canonical seed marker"
+	for marker_test_case in missing-index duplicate-index malformed-index wrong-layout duplicate-layout unpinned-legacy; do
+		case "$marker_test_case" in
+			missing-index) printf 'SEED_FLASH_LAYOUT_SHA256=%s\n' "$seed_flash_layout_sha256" ;;
+			duplicate-index)
+				printf 'SEED_FLASH_INDEX_SHA256=%s\nSEED_FLASH_INDEX_SHA256=%s\nSEED_FLASH_LAYOUT_SHA256=%s\n' \
+					"$marker_test_digest" "$marker_test_digest" "$seed_flash_layout_sha256" ;;
+			malformed-index)
+				printf 'SEED_FLASH_INDEX_SHA256=bad\nSEED_FLASH_LAYOUT_SHA256=%s\n' "$seed_flash_layout_sha256" ;;
+			wrong-layout)
+				printf 'SEED_FLASH_INDEX_SHA256=%s\nSEED_FLASH_LAYOUT_SHA256=%s\n' \
+					"$marker_test_digest" "$marker_test_digest" ;;
+			duplicate-layout)
+				printf 'SEED_FLASH_INDEX_SHA256=%s\nSEED_FLASH_LAYOUT_SHA256=%s\nSEED_FLASH_LAYOUT_SHA256=%s\n' \
+					"$marker_test_digest" "$seed_flash_layout_sha256" "$seed_flash_layout_sha256" ;;
+			unpinned-legacy) printf 'SEED_FLASH_INDEX_SHA256=%s\n' "$marker_test_digest" ;;
+		esac > "$marker_test_file"
+		if validate_seed_marker "$marker_test_file"; then
+			die "self-test accepted invalid seed marker: $marker_test_case"
+		fi
+	done
+)
 
 require_macos()
 {
@@ -349,18 +415,144 @@ clean_directory()
 	find "$directory" -mindepth 1 -delete
 }
 
+bootkit_source_paths()
+{
+	printf '%s\n' \
+		macos-rcm/Makefile \
+		macos-rcm/src/jetson_rcm.c \
+		macos-rcm/scripts/build-bch.py \
+		macos-rcm/scripts/apply-bct-delta.py \
+		tools/import-nvidia-flash-index.py \
+		tools/qspi-flash.py
+}
+
+validate_bootkit_manifest()
+{
+	need_file "$bootkit_manifest"
+	manifest_paths=$(awk '
+		NF != 2 || length($1) != 64 || $1 ~ /[^0123456789abcdef]/ ||
+			substr($0, 65, 2) != "  " { exit 1 }
+		{ print $2 }
+	' "$bootkit_manifest") || die "invalid vendored source checksum manifest"
+	[ "$(printf '%s\n' "$manifest_paths" | LC_ALL=C sort)" = \
+		"$(bootkit_source_paths | LC_ALL=C sort)" ] || \
+		die "vendored source manifest must cover exactly the six native source files"
+}
+
+verify_bootkit_sources()
+(
+	bootkit_source_root=$1
+	need_command shasum
+	validate_bootkit_manifest
+	for bootkit_path in $(bootkit_source_paths); do
+		[ -f "$bootkit_source_root/$bootkit_path" ] && \
+			[ ! -L "$bootkit_source_root/$bootkit_path" ] || \
+			die "native source file is missing or is not a regular file: $bootkit_path"
+	done
+	cd "$bootkit_source_root" || die "cannot open native source directory"
+	shasum -a 256 -c "$bootkit_manifest" || die "native source checksum verification failed"
+)
+
+stage_bootkit_sources()
+{
+	validate_bootkit_manifest
+	if [ -n "$bootkit_dir" ]; then
+		need_command git
+		[ "$(git -C "$bootkit_dir" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || \
+			die "HELM_T234_BOOTKIT_DIR is not a Git checkout: $bootkit_dir"
+		git -C "$bootkit_dir" cat-file -e "$bootkit_commit^{commit}" 2>/dev/null || \
+			die "t234-bootkit does not contain pinned commit $bootkit_commit"
+	else
+		verify_bootkit_sources "$bootkit_vendor_dir" || \
+			die "vendored native source validation failed"
+	fi
+	clean_directory "$bootkit_work_dir" || die "cannot clean native source build directory"
+	for bootkit_path in $(bootkit_source_paths); do
+		mkdir -p "$bootkit_work_dir/$(dirname "$bootkit_path")" || \
+			die "cannot create native source build directory"
+		if [ -n "$bootkit_dir" ]; then
+			git -C "$bootkit_dir" show "$bootkit_commit:$bootkit_path" \
+				> "$bootkit_work_dir/$bootkit_path" || \
+				die "pinned Git source is missing: $bootkit_path"
+		else
+			cp "$bootkit_vendor_dir/$bootkit_path" "$bootkit_work_dir/$bootkit_path" || \
+				die "cannot copy vendored native source: $bootkit_path"
+		fi
+	done
+	verify_bootkit_sources "$bootkit_work_dir" || die "staged native source validation failed"
+}
+
+bootkit_sources_self_test()
+(
+	need_command shasum
+	need_command git
+	bootkit_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/helm-bootkit-test.XXXXXX")
+	trap 'rm -rf "$bootkit_test_dir"' EXIT
+	trap 'exit 1' HUP INT TERM
+	bootkit_vendor_dir=$bootkit_test_dir/vendor
+	bootkit_manifest=$bootkit_vendor_dir/SHA256SUMS
+	bootkit_work_dir=$bootkit_test_dir/work
+	bootkit_dir=
+	for bootkit_path in $(bootkit_source_paths); do
+		mkdir -p "$bootkit_vendor_dir/$(dirname "$bootkit_path")"
+		printf 'source fixture: %s\n' "$bootkit_path" > "$bootkit_vendor_dir/$bootkit_path"
+	done
+	(
+		cd "$bootkit_vendor_dir"
+		for bootkit_path in $(bootkit_source_paths); do
+			shasum -a 256 "$bootkit_path"
+		done
+	) > "$bootkit_manifest"
+	stage_bootkit_sources >/dev/null
+	cmp "$bootkit_vendor_dir/macos-rcm/src/jetson_rcm.c" \
+		"$bootkit_work_dir/macos-rcm/src/jetson_rcm.c"
+
+	printf 'tampered\n' >> "$bootkit_vendor_dir/macos-rcm/Makefile"
+	if (stage_bootkit_sources) >/dev/null 2>&1; then
+		die "self-test accepted tampered vendored source"
+	fi
+	cp "$bootkit_work_dir/macos-rcm/Makefile" "$bootkit_vendor_dir/macos-rcm/Makefile"
+	rm "$bootkit_vendor_dir/tools/qspi-flash.py"
+	if (stage_bootkit_sources) >/dev/null 2>&1; then
+		die "self-test accepted missing vendored source"
+	fi
+	cp "$bootkit_work_dir/tools/qspi-flash.py" "$bootkit_vendor_dir/tools/qspi-flash.py"
+	cp "$bootkit_manifest" "$bootkit_test_dir/complete-manifest"
+	sed '$d' "$bootkit_test_dir/complete-manifest" > "$bootkit_manifest"
+	if (stage_bootkit_sources) >/dev/null 2>&1; then
+		die "self-test accepted an incomplete source manifest"
+	fi
+	cp "$bootkit_test_dir/complete-manifest" "$bootkit_manifest"
+
+	# An explicit checkout supplies only committed files at the requested pin,
+	# regardless of later commits or local worktree modifications.
+	bootkit_dir=$bootkit_test_dir/checkout
+	git init -q "$bootkit_dir"
+	cp -R "$bootkit_vendor_dir/." "$bootkit_dir/"
+	git -C "$bootkit_dir" add .
+	git -C "$bootkit_dir" -c user.name=Fixture -c user.email=fixture@example.com \
+		-c commit.gpgsign=false commit -qm fixture
+	bootkit_commit=$(git -C "$bootkit_dir" rev-parse HEAD)
+	printf 'later source\n' >> "$bootkit_dir/macos-rcm/Makefile"
+	git -C "$bootkit_dir" add macos-rcm/Makefile
+	git -C "$bootkit_dir" -c user.name=Fixture -c user.email=fixture@example.com \
+		-c commit.gpgsign=false commit -qm later
+	printf 'uncommitted source\n' >> "$bootkit_dir/macos-rcm/Makefile"
+	stage_bootkit_sources >/dev/null
+	cmp "$bootkit_vendor_dir/macos-rcm/Makefile" "$bootkit_work_dir/macos-rcm/Makefile"
+	bootkit_commit=$(git -C "$bootkit_dir" rev-parse HEAD)
+	if (stage_bootkit_sources) >/dev/null 2>&1; then
+		die "self-test accepted Git sources with the wrong checksums"
+	fi
+)
+
 build_bootkit()
 {
-	need_command git
 	need_command patch
-	need_command tar
-	[ -d "$bootkit_dir/.git" ] || die "t234-bootkit checkout is missing: $bootkit_dir"
-	git -C "$bootkit_dir" cat-file -e "$bootkit_commit^{commit}" 2>/dev/null || \
-		die "t234-bootkit does not contain pinned commit $bootkit_commit"
+	need_command make
+	need_command pkg-config
 	need_file "$bootkit_patch"
-	clean_directory "$bootkit_work_dir"
-	git -C "$bootkit_dir" archive "$bootkit_commit" macos-rcm tools | \
-		tar -x -C "$bootkit_work_dir"
+	stage_bootkit_sources || die "cannot stage native loader sources"
 	patch -d "$bootkit_work_dir" -p1 -f -i "$bootkit_patch"
 	make -C "$bootkit_work_dir/macos-rcm"
 	need_file "$loader"
@@ -461,21 +653,6 @@ run_all_family_profiles()
 bootstrap()
 {
 	require_macos
-	need_command gh
-	need_command make
-	need_command pkg-config
-	if [ ! -d "$bootkit_dir/.git" ]; then
-		mkdir -p "$(dirname "$bootkit_dir")"
-		gh repo clone diodeinc/t234-bootkit "$bootkit_dir"
-	fi
-	if ! git -C "$bootkit_dir" cat-file -e "$bootkit_commit^{commit}" 2>/dev/null; then
-		die "t234-bootkit does not contain pinned commit $bootkit_commit"
-	fi
-	current=$(git -C "$bootkit_dir" rev-parse HEAD)
-	if [ "$current" != "$bootkit_commit" ]; then
-		printf 'warning: t234-bootkit HEAD is %s; validated pin is %s\n' \
-			"$current" "$bootkit_commit" >&2
-	fi
 	build_bootkit
 }
 
@@ -485,7 +662,7 @@ doctor()
 	failures=0
 	printf 'profile: %s (P3767-%s, USB 0955:%s)\n' \
 		"$profile_id" "$profile_sku" "${profile_usb_pid#0x}"
-	for command in apko brew cmake cpio curl dtc fdtoverlay git lz4 make patch \
+	for command in apko brew cmake cpio curl dtc fdtoverlay lz4 make patch \
 		pkg-config python3 shasum tar zstd
 	do
 		if command -v "$command" >/dev/null 2>&1; then
@@ -599,12 +776,12 @@ validate_signed_profile()
 			SIGNING=zerosbk \
 			SOURCE=NVIDIA_R39.2_MULTI_SPEC_BUP \
 			NVIDIA_CAPSULE_SHA256="$family_capsule_sha256" \
-			NVIDIA_BUP_SHA256="$family_bup_sha256" \
-			SEED_FLASH_INDEX_SHA256="$seed_flash_index_sha256"
+			NVIDIA_BUP_SHA256="$family_bup_sha256"
 		do
 			grep -Fqx -- "$marker_line" "$family_marker" || \
 				die "derived family marker mismatch: $marker_line"
 		done
+		validate_seed_marker "$family_marker" || die "derived family seed marker mismatch"
 		need_file "$signed_dir/SHA256SUMS"
 		(
 			cd "$signed_dir"
@@ -638,7 +815,7 @@ validate_signed_profile()
 	done
 	[ -n "$version_payload" ] || \
 		die "signed profile has no qspi_bootblob_ver.txt payload"
-	grep -E "^BOARDID=3767 BOARDSKU=$profile_sku FAB=[0-9]+$" \
+	grep -E "^BOARDID=3767 BOARDSKU=$profile_sku FAB=[0123456789]+$" \
 		"$version_payload" >/dev/null || \
 		die "QSPI version payload is not for P3767-$profile_sku: $version_payload"
 }

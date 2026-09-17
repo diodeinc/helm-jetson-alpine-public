@@ -18,6 +18,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -78,8 +79,14 @@ LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 BUILD_BCH_SHA256 = "28364818de59a99a0ccebf36d8c791313a440308293ec61cc693875355db1909"
 APPLY_BCT_DELTA_SHA256 = "20a2930a29a4ce36eaad313c0c61bc31e01ad251c98ebcb9ae2feb0d1bbe8237"
 
+# Pin layout facts, excluding per-build payload sizes/digests that are replaced
+# from the pinned BUP below. NVIDIA's GPT GUIDs and VER timestamps vary between
+# otherwise identical seed builds. Canonical encoding is compact JSON of the
+# stripped string fields 0, 1, 2, 3, 4, 6 in row order, without a final newline.
+SEED_FLASH_LAYOUT_SHA256 = "c923c06f9e4fbe7bde3c52fa59b93ab15bcf7dfa2f8c5f6dff5c80d7ec9f068d"
+SEED_LAYOUT_COLUMNS = (0, 1, 2, 3, 4, 6)
+
 SEED_HASHES = {
-    "flash.idx": "d6cbc5ab52375bdc917062c88840a411a0e1eb195b466be119df24209c8b1727",
     "mb1_bct_MB1_sigheader.bct.encrypt": "4533a6604413fa0c8f59746e23e7c3f7d06f2cba1e753dc0a2552a738ae7c04a",
     "mb1_cold_boot_bct_MB1_sigheader.bct.encrypt": "6c56cba06d45b839bf802693d3849f3e88374093834f015691f369abedb0cbe9",
     "mem_rcm_sigheader.bct.encrypt": "d05e00d84be7565bfaf3640e5db4a8848b39e7157f394f29d85da17279ea7fc2",
@@ -89,7 +96,6 @@ SEED_HASHES = {
     "mce_flash_o10_cr_prod_sigheader.bin.encrypt": "ea39655b16045d1267944848a442a57e23ba3ca851079444c80f7b13718807ac",
     "tsec_t234_sigheader.bin.encrypt": "61c5fe2f13eb64e348807e354b99f339ac736a230084fbd7a5306a4ced4c4778",
     "applet_t234_sigheader.bin.encrypt": "b4c4f89d64fae8e03ab206118300b8aa3dd1cf29ac4a5f53894fc87767c0e48f",
-    "mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt": "7a7e8d19529013c3c6799e7493404ae0d152dd544e01e778d7023fb8b3102bef",
     "xusb_t234_prod_sigheader.bin.encrypt": "0f5e39ef3ff75320849554c3ab0494aadc98799bff9bf45760c78a77f2d103cb",
     "nvpva_020_sigheader.fw.encrypt": "6d43aa621b1f778fd7a42f1b8b94995644a185bbc830d28efa019d19f62e940e",
     "nvdec_t234_prod_sigheader.fw.encrypt": "b1e08069ed8008cf8891d3fb826aa98945833609415c7e77a4e06e6c0f262630",
@@ -106,7 +112,6 @@ COMMON_RCM_FILES = (
     "mce_flash_o10_cr_prod_sigheader.bin.encrypt",
     "tsec_t234_sigheader.bin.encrypt",
     "applet_t234_sigheader.bin.encrypt",
-    "mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt",
     "xusb_t234_prod_sigheader.bin.encrypt",
     "nvpva_020_sigheader.fw.encrypt",
     "nvdec_t234_prod_sigheader.fw.encrypt",
@@ -347,9 +352,50 @@ def select_entry(entries: list[BupEntry], name: str, tnspec: str) -> BupEntry:
     return shared[0]
 
 
+def validate_seed_flash_index(path: Path) -> list[list[str]]:
+    try:
+        with path.open(newline="", encoding="utf-8") as stream:
+            rows = [[field.strip() for field in row] for row in csv.reader(stream, strict=True)]
+    except (OSError, UnicodeError, csv.Error) as error:
+        fail(f"cannot read seed flash index {path}: {error}")
+    if len(rows) != 61 or any(len(row) != 8 for row in rows):
+        fail("seed flash index must have exactly 61 eight-field QSPI rows")
+    locators: set[str] = set()
+    populated = 0
+    for ordinal, row in enumerate(rows):
+        entry, locator, offset, size, filename, payload_size, _attributes, digest = row
+        if entry != str(ordinal) or not locator.startswith("3:0:"):
+            fail("seed flash index has an unexpected row order or non-QSPI device")
+        if locator in locators:
+            fail("seed flash index has a duplicate partition")
+        locators.add(locator)
+        if re.fullmatch(r"[0-9]+", offset) is None or re.fullmatch(r"[0-9]+", size) is None:
+            fail("seed flash index offset/size must be decimal integers")
+        if int(size) <= 0:
+            fail("seed flash index contains a nonpositive partition size")
+        if filename:
+            populated += 1
+            if filename in (".", "..") or re.fullmatch(r"[A-Za-z0-9_.+-]+", filename) is None:
+                fail("seed flash index has an unsafe payload filename")
+            if re.fullmatch(r"[0-9]+", payload_size) is None or not 0 < int(payload_size) <= int(size):
+                fail("seed flash index has an invalid payload size")
+            if re.fullmatch(r"[0-9a-f]{40}", digest) is None:
+                fail("seed flash index has an invalid payload SHA-1")
+        elif payload_size or digest:
+            fail("empty seed partition has payload metadata")
+    if populated != 52:
+        fail("seed flash index must have exactly 52 populated partitions")
+    canonical = [[row[column] for column in SEED_LAYOUT_COLUMNS] for row in rows]
+    actual = sha256_bytes(json.dumps(canonical, separators=(",", ":")).encode("utf-8"))
+    if actual != SEED_FLASH_LAYOUT_SHA256:
+        fail(f"seed flash index canonical layout SHA-256 mismatch: {actual}")
+    return rows
+
+
 def verify_seed(seed: Path) -> None:
     if not seed.is_dir():
         fail(f"qualified P3767-0001 seed directory is missing: {seed}")
+    validate_seed_flash_index(seed / "flash.idx")
     for filename, expected in SEED_HASHES.items():
         path = seed / filename
         if not path.is_file():
@@ -615,11 +661,7 @@ def build_flash_index(
     entries: list[BupEntry],
     profile: Profile,
 ) -> tuple[int, int]:
-    rows: list[list[str]] = []
-    with (seed / "flash.idx").open(newline="", encoding="utf-8") as stream:
-        rows = [[field.strip() for field in row] for row in csv.reader(stream)]
-    if any(len(row) != 8 for row in rows):
-        fail("qualified seed flash.idx does not have eight fields per row")
+    rows = validate_seed_flash_index(seed / "flash.idx")
 
     qspi_count = 0
     populated = 0
@@ -801,7 +843,7 @@ def build_rcm_components(
 
 
 def write_marker_and_sums(
-    output: Path, profile_name: str, profile: Profile
+    output: Path, profile_name: str, profile: Profile, seed_index_sha256: str
 ) -> None:
     marker = output / "HELM_R39_FAMILY_INPUT_V1"
     marker.write_text(
@@ -816,7 +858,8 @@ def write_marker_and_sums(
                 "SOURCE=NVIDIA_R39.2_MULTI_SPEC_BUP",
                 f"NVIDIA_CAPSULE_SHA256={CAPSULE_SHA256}",
                 f"NVIDIA_BUP_SHA256={BUP_SHA256}",
-                f"SEED_FLASH_INDEX_SHA256={SEED_HASHES['flash.idx']}",
+                f"SEED_FLASH_INDEX_SHA256={seed_index_sha256}",
+                f"SEED_FLASH_LAYOUT_SHA256={SEED_FLASH_LAYOUT_SHA256}",
                 "",
             )
         ),
@@ -846,6 +889,7 @@ def build(arguments: argparse.Namespace) -> None:
     if output == seed or seed in output.parents:
         fail("output must not be the qualified seed or one of its descendants")
     verify_seed(seed)
+    seed_index_sha256 = sha256_file(seed / "flash.idx")
     verify_helper(arguments.build_bch, BUILD_BCH_SHA256, "build-bch")
     verify_helper(
         arguments.apply_bct_delta, APPLY_BCT_DELTA_SHA256, "apply-bct-delta"
@@ -862,8 +906,6 @@ def build(arguments: argparse.Namespace) -> None:
         qspi_count, populated = build_flash_index(seed, temporary, entries, profile)
         for filename in COMMON_RCM_FILES:
             payload = (seed / filename).read_bytes()
-            if filename == "mb2_t234_with_mb2_bct_MB2_sigheader.bin.encrypt":
-                payload = disable_absent_cvb_eeprom(payload, "R39 recovery MB2")
             put_file(temporary, filename, payload)
         build_rcm_components(
             seed,
@@ -876,7 +918,7 @@ def build(arguments: argparse.Namespace) -> None:
             work,
         )
         shutil.rmtree(work)
-        write_marker_and_sums(temporary, arguments.profile, profile)
+        write_marker_and_sums(temporary, arguments.profile, profile, seed_index_sha256)
         os.replace(temporary, output)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -885,6 +927,93 @@ def build(arguments: argparse.Namespace) -> None:
         f"Prepared {arguments.profile} from NVIDIA's pinned R39.2 multi-spec BUP "
         f"({qspi_count} QSPI partitions, {populated} populated) in {output}"
     )
+
+
+def flash_index_self_test(mb2_component: bytes) -> None:
+    fixture = Path(__file__).resolve().parent / (
+        "profile-data/r39.2/helm-orin-nx-8gb-r39.2/seed-flash-layout.json"
+    )
+    canonical = json.loads(fixture.read_text(encoding="utf-8"))
+    rows = []
+    for entry, locator, offset, size, filename, attributes in canonical:
+        rows.append([
+            entry, locator, offset, size, filename,
+            "1" if filename else "", attributes, "0" * 40 if filename else "",
+        ])
+
+    def write_index(path: Path, values: list[list[str]]) -> None:
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            csv.writer(stream).writerows(values)
+
+    with tempfile.TemporaryDirectory(prefix="helm-index-self-test-") as directory:
+        work = Path(directory)
+        first_seed = work / "first-seed"
+        second_seed = work / "second-seed"
+        first_seed.mkdir()
+        second_seed.mkdir()
+        first_index = first_seed / "flash.idx"
+        second_index = second_seed / "flash.idx"
+        write_index(first_index, rows)
+        validate_seed_flash_index(first_index)
+        changed_metadata = [row.copy() for row in rows]
+        for row in changed_metadata:
+            if row[4]:
+                row[5] = "2"
+                row[7] = "f" * 40
+        write_index(second_index, changed_metadata)
+        validate_seed_flash_index(second_index)
+        if sha256_file(first_index) == sha256_file(second_index):
+            fail("self-test index metadata fixtures must differ")
+
+        mutations = {
+            "offset": (0, 2, "1"),
+            "filename": (0, 4, "different.bct"),
+            "attributes": (0, 6, "expand-<reserved>-1"),
+            "traversal": (0, 4, "../br_bct_BR.bct"),
+            "duplicate partition": (1, 1, rows[0][1]),
+            "non-QSPI": (0, 1, "6:0:BCT"),
+            "payload size": (0, 5, "invalid"),
+            "payload digest": (0, 7, "invalid"),
+        }
+        invalid_rows = {}
+        for label, (row_number, column, value) in mutations.items():
+            changed = [row.copy() for row in rows]
+            changed[row_number][column] = value
+            invalid_rows[label] = changed
+        reordered = [row.copy() for row in rows]
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        invalid_rows["order"] = reordered
+        unpopulated = [row.copy() for row in rows]
+        for column in (4, 5, 7):
+            unpopulated[0][column] = ""
+        invalid_rows["population"] = unpopulated
+        invalid_rows["row count"] = rows[:-1]
+        invalid_rows["field count"] = [rows[0][:-1], *rows[1:]]
+        for label, values in invalid_rows.items():
+            invalid = work / "invalid.idx"
+            write_index(invalid, values)
+            try:
+                validate_seed_flash_index(invalid)
+            except SystemExit:
+                pass
+            else:
+                fail(f"self-test accepted changed seed index {label}")
+
+        # Metadata ignored by the canonical pin must also be ignored by the
+        # actual emitter: both seeds produce identical payloads and indexes.
+        entries = []
+        for name in sorted(set(QSPI_PART_TO_BUP.values())):
+            payload = mb2_component if name == "mb2" else b"fixture-" + name.encode()
+            entries.append(BupEntry(name, 0, len(payload), BUP_COMPONENT_VERSION, 0, "", payload))
+        outputs = []
+        for number, seed in enumerate((first_seed, second_seed)):
+            (seed / "eks_t234_sigheader.img.encrypt").write_bytes(b"fixture-eks")
+            output = work / f"output-{number}"
+            output.mkdir()
+            build_flash_index(seed, output, entries, PROFILES["helm-orin-nx-8gb-r39.2"])
+            outputs.append({path.name: path.read_bytes() for path in output.iterdir()})
+        if outputs[0] != outputs[1]:
+            fail("self-test seed payload metadata changed generated firmware/index")
 
 
 def self_test() -> None:
@@ -975,6 +1104,7 @@ def self_test() -> None:
         pass
     else:
         fail("self-test MB2 mutation accepted an unexpected EEPROM address")
+    flash_index_self_test(mb2_component)
     print("build-r39-family-inputs.py self-test passed")
 
 

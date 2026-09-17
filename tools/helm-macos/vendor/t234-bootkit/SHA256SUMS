@@ -1,0 +1,6 @@
+97282c8bdcc20cffc2b83082c7ed4d3ee03f0b134857a10d490d54f0abdf8fc2  macos-rcm/Makefile
+9a4b79ce022a5677ebd3947a5aeb470b786125bfe99b83b686a455fef58d0cee  macos-rcm/src/jetson_rcm.c
+28364818de59a99a0ccebf36d8c791313a440308293ec61cc693875355db1909  macos-rcm/scripts/build-bch.py
+20a2930a29a4ce36eaad313c0c61bc31e01ad251c98ebcb9ae2feb0d1bbe8237  macos-rcm/scripts/apply-bct-delta.py
+f56358d109ad88b0eadaa9feaade3d0cee0421d8747d85776c420c6144a4d3b9  tools/import-nvidia-flash-index.py
+4bf5ce571b90f32d4711b94506a253e30d1f8b82113bf50a2a2936f26723b21c  tools/qspi-flash.py
