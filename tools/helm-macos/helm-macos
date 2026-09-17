@@ -163,15 +163,16 @@ require_interactive_tty()
 valid_nvme_device()
 {
 	case "$1" in
-		/dev/nvme[0-9]n[0-9]) return 0 ;;
+		/dev/nvme[0123456789]n[0123456789]) return 0 ;;
 		*) return 1 ;;
 	esac
 }
 
 valid_usb_location()
 {
+	# Explicit ASCII sets keep locale collation from accepting uppercase or accents.
 	case "$1" in
-		0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) \
+		0x[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) \
 			return 0 ;;
 		*) return 1 ;;
 	esac
@@ -332,7 +333,7 @@ helm_macos_self_test()
 		fi
 	done
 	valid_usb_location 0x01230000
-	for invalid_location in 0x0123000 0x0123000A 01230000; do
+	for invalid_location in 0x0123000 0x0123000A 0x0123000á 01230000; do
 		if valid_usb_location "$invalid_location"; then
 			die "self-test accepted an invalid USB location"
 		fi
@@ -349,7 +350,7 @@ validate_seed_marker()
 		$1 == "SEED_FLASH_INDEX_SHA256" {
 			index_count++
 			index_digest = $2
-			if (NF != 2 || length($2) != 64 || $2 ~ /[^0-9a-f]/) bad = 1
+			if (NF != 2 || length($2) != 64 || $2 ~ /[^0123456789abcdef]/) bad = 1
 		}
 		$1 == "SEED_FLASH_LAYOUT_SHA256" {
 			layout_count++
@@ -429,7 +430,7 @@ validate_bootkit_manifest()
 {
 	need_file "$bootkit_manifest"
 	manifest_paths=$(awk '
-		NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ ||
+		NF != 2 || length($1) != 64 || $1 ~ /[^0123456789abcdef]/ ||
 			substr($0, 65, 2) != "  " { exit 1 }
 		{ print $2 }
 	' "$bootkit_manifest") || die "invalid vendored source checksum manifest"
@@ -814,7 +815,7 @@ validate_signed_profile()
 	done
 	[ -n "$version_payload" ] || \
 		die "signed profile has no qspi_bootblob_ver.txt payload"
-	grep -E "^BOARDID=3767 BOARDSKU=$profile_sku FAB=[0-9]+$" \
+	grep -E "^BOARDID=3767 BOARDSKU=$profile_sku FAB=[0123456789]+$" \
 		"$version_payload" >/dev/null || \
 		die "QSPI version payload is not for P3767-$profile_sku: $version_payload"
 }
