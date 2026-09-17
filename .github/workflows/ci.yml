@@ -99,9 +99,14 @@ jobs:
           done
           python3 -m py_compile \
             tools/helm-macos/build-r39-family-inputs.py \
+            tools/helm-macos/generate-r39-seed.py \
             tools/helm-macos/build-rcm-blob.py \
             tools/helm-macos/helm-provision-console.py \
             tools/helm-macos/mkbootimg.py \
+            tools/helm-macos/vendor/t234-bootkit/macos-rcm/scripts/build-bch.py \
+            tools/helm-macos/vendor/t234-bootkit/macos-rcm/scripts/apply-bct-delta.py \
+            tools/helm-macos/vendor/t234-bootkit/tools/import-nvidia-flash-index.py \
+            tools/helm-macos/vendor/t234-bootkit/tools/qspi-flash.py \
             tools/helm-web/prepare-site.py
           node --test \
             tools/helm-web/test/rcm.test.mjs \
@@ -111,6 +116,7 @@ jobs:
           node --check tools/helm-web/server.mjs
           tools/helm-web/prepare-site.py self-test
           tools/helm-macos/build-r39-family-inputs.py --self-test
+          tools/helm-macos/generate-r39-seed.py --help >/dev/null
           tools/helm-macos/build-rcm-blob.py --self-test
           tools/helm-macos/helm-provision-console.py --self-test
           tools/helm-macos/helm-macos self-test
@@ -151,6 +157,15 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Build vendored native recovery loader
+        run: |
+          unset HELM_T234_BOOTKIT_DIR
+          tools/helm-macos/helm-macos bootstrap
+          loader=build/helm-macos/work/t234-bootkit/macos-rcm/jetson-rcm
+          "$loader" --help >/dev/null
+          "$loader" products
+          file "$loader" | grep -q 'Mach-O 64-bit executable arm64'
 
       - name: Test native Android boot-image builder
         run: |

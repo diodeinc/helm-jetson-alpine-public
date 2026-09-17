@@ -35,8 +35,10 @@ the P3767 modules for which Helm was designed.
 
 ## Current status
 
-The host path is native Apple-silicon macOS. It uses no Docker, Linux VM,
-Rosetta, or NVIDIA Linux host executable.
+The OS build and USB transfer path runs natively on Apple-silicon macOS.
+Generating the firmware seed from public inputs is a separate, one-time
+step that runs NVIDIA's Linux tools in a Docker container without hardware
+access. An existing verified seed skips that step.
 
 - `apko` resolves the aarch64 Alpine filesystem directly on macOS.
 - Native libarchive, `dtc`, `cpio`, zstd, and Python build the rootfs, device
@@ -48,7 +50,7 @@ Rosetta, or NVIDIA Linux host executable.
   menu, kernel, initramfs, and DTBs on the `APP` root partition. The installer
   validates the family bundle's P3767 `BOARD_SKU` and selects its matching
   premerged Helm DTB as the installed default.
-- The separate `t234-bootkit` native libusb loader sends the six-file RCM
+- The included `t234-bootkit` native libusb loader sends the six-file RCM
   bundle from macOS. The host-side `boot` operation is volatile and does not
   write QSPI or NVMe.
 - Native Python tooling extracts the selected SKU from NVIDIA's pinned R39.2
@@ -80,15 +82,16 @@ Requirements:
 
 - Apple-silicon macOS
 - NVIDIA `Jetson_Linux_R39.2.0_aarch64.tbz2`
-- access to [`diodeinc/t234-bootkit`](https://github.com/diodeinc/t234-bootkit)
-- the qualified, unfused P3767-0001 R39.2 signed seed catalog
+- Docker with `linux/amd64` support to generate the firmware seed, or an
+  existing verified P3767-0001 R39.2 seed
 
-**Build availability:** `t234-bootkit` is currently internal to Diode, and the
-qualified seed is not distributed in this repository. A public checkout can
-run source checks and synthetic tests, but cannot build the complete recovery
-bundle without separately authorized access to those inputs. No public seed
-download or standalone seed-generation procedure is provided yet. Do not use
-a different module's firmware to work around missing inputs.
+**Build availability:** the pinned loader and build helpers are included in
+[`tools/helm-macos/vendor/t234-bootkit`](tools/helm-macos/vendor/t234-bootkit).
+`bootstrap` builds the native loader without access to another repository or
+any firmware. The seed generator downloads and verifies NVIDIA's public BSP,
+then regenerates the required firmware. No private repository or historical
+seed download is required. Firmware archives and generated bundles remain
+outside Git; there is no public prebuilt-bundle download in this repository.
 
 Install host tools:
 
@@ -96,24 +99,40 @@ Install host tools:
 brew install apko cmake cpio dtc libarchive libusb lz4 pkg-config shellcheck zstd
 ```
 
-Place the BSP at `build/downloads/Jetson_Linux_R39.2.0_aarch64.tbz2`, then:
+Start Docker, then generate the seed once. The command downloads the 1.29 GB
+BSP if absent, verifies its pinned SHA-256, and records generation logs and
+input provenance. It never executes the generated flash command or accesses
+a board:
+
+```sh
+python3 tools/helm-macos/generate-r39-seed.py \
+  --output build/inputs/r39.2/helm-orin-nx-8gb-r39.2
+```
+
+To enable SSH on the installed system, set `HELM_SSH_AUTHORIZED_KEYS_FILE` to
+your SSH **public-key** file before building. SSH is key-only, and builds
+without this option contain no authorized keys. See the
+[Alpine build instructions](os/alpine/README.md) for details.
+
+Then build a complete P3767-0001 recovery bundle natively:
 
 ```sh
 ./tools/helm-macos/helm-macos bootstrap
-./tools/helm-macos/helm-macos build
-./tools/helm-macos/helm-macos profiles
+./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 family-all
 ```
 
-The BSP is consumed as a data archive. Its Linux host programs are never
-executed. The builder automatically downloads and hash-checks NVIDIA's official
-R39.2 bootloader package; it extracts the T23x UEFI launcher and multi-spec
-capsule as data, and neither is executed on the Mac.
+After seed generation, the native builder consumes the BSP as data. It also
+downloads and hash-checks NVIDIA's official R39.2 bootloader package, extracting
+the T23x UEFI launcher and multi-spec capsule as data. No Linux host program is
+executed during the native image build, bundling, verification, or USB transfer.
 
-Point the family builder at the qualified 0001 seed, then build one selected
-profile or the complete five-profile matrix:
+The default seed path is the output above with `/signed` appended. To use a
+seed in another location, set `HELM_R39_SEED_SIGNED_DIR`. You can build a
+different selected profile or the complete five-profile matrix:
 
 ```sh
-export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/qualified-p3767-0001/signed
+# Optional when using a seed outside the default directory:
+# export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/p3767-0001/signed
 
 ./tools/helm-macos/helm-macos \
   --profile helm-orin-nano-4gb-r39.2 family-all
@@ -128,6 +147,12 @@ catalogs can still be supplied directly through `HELM_R39_SIGNED_DIR`. See
 and the bundle contract.
 
 ## RAM boot and target-side install
+
+If you already have a complete recovery bundle for your exact module, follow
+[the prepared-bundle instructions](tools/helm-macos/README.md#using-a-prepared-recovery-bundle).
+This path needs the included native loader but does not require the BSP or
+seed build inputs. The installer inside an existing bundle must be rebuilt
+to pick up source fixes.
 
 For guided bench provisioning, connect one supported Helm directly to the Mac through
 its recovery USB port, put it in force recovery, and run one guarded command:

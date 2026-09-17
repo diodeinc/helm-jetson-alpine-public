@@ -1,12 +1,12 @@
 # Native Helm recovery from macOS
 
-This is the supported host workflow. Every host executable is a native arm64
-Mach-O program or a portable script running on macOS. There is no Docker,
-Linux VM, USB/IP bridge, Rosetta process, or NVIDIA Linux host utility in the
-build, bundle, verification, or RCM transfer path.
+This is the supported host workflow. The OS build, bundle, verification, and
+RCM transfer use native arm64 programs or portable scripts on macOS. The
+separate seed-generation step uses NVIDIA's Linux tools in a Docker container;
+it can be skipped when a verified seed is already available.
 
-The Linux boundary is on the Jetson: macOS sends a recovery OS into RAM, and
-that OS uses normal target drivers and storage tools to install NVMe and QSPI.
+The native flashing path sends a recovery OS into the Jetson's RAM. That OS
+uses normal target drivers and storage tools to install NVMe and QSPI.
 
 ## Components
 
@@ -17,30 +17,39 @@ that OS uses normal target drivers and storage tools to install NVMe and QSPI.
   validation, record layout, and SHA-512 header generation
 - `build-r39-family-inputs.py`: pinned multi-spec BUP parser, exact-SKU QSPI
   catalog builder, and native MB1/memory/DCE recovery-component derivation
+- `generate-r39-seed.py`: offline generation of the seed from NVIDIA's pinned
+  public BSP, followed by firmware and partition-layout verification
 - `r39.2-rcm-blob.xml`: fixed R39.2 recovery component order with per-profile
   aliases for module-specific firmware
 - `profiles`: allowlisted P3767 SKU, recovery PID, DTB, BPMP, and DCE mappings
 - `profile-data/r39.2/<profile>`: retained profile payloads whose digests are
   checked against NVIDIA's recorded QSPI flash index
 - `t234-bootkit-orin-family.patch`: reproducible four-PID extension applied to
-  a clean archive of the pinned native loader source
+  a verified build-directory copy of the pinned native loader source
+- `vendor/t234-bootkit`: six pinned source files for the native loader, BCH/BCT
+  helpers, flash-index importer, and QSPI image builder
 
 The blob builder's layout is checked byte-for-byte against a retained
 NVIDIA-generated two-entry fixture. The complete 17-entry R39.2 firmware-only
 input set also reproduces NVIDIA's recorded 24,522,080-byte blob size. The
 Alpine recovery kernel and Helm DTB extend it to 19 entries.
 
-USB transport comes from the separately versioned
-[`diodeinc/t234-bootkit`](https://github.com/diodeinc/t234-bootkit). The
-validated source pin is `5cedc336c859a2561644475aef057feaf41e73c0`; the
-tracked family patch is applied only to a build-directory copy, so an arbitrary
-or dirty sibling checkout cannot alter the loader that is compiled.
+USB transport and the four build helpers are included in
+[`vendor/t234-bootkit`](vendor/t234-bootkit/README.md), copied from source pin
+`5cedc336c859a2561644475aef057feaf41e73c0`. `bootstrap` verifies all six source
+files against `SHA256SUMS`, copies them into the build directory, applies the
+tracked family patch, and compiles the loader. It needs no GitHub credentials,
+separate checkout, or firmware. Missing or modified source fails before
+compilation.
 
-The loader repository is currently internal to Diode. Complete builds also
-need the qualified seed catalog described below, which is not distributed
-here and has no public generation procedure yet. Source publication does not
-make those inputs publicly available. Use separately authorized inputs;
-synthetic source tests can run without the loader or firmware archives.
+An explicit `HELM_T234_BOOTKIT_DIR` can select a local Git checkout for
+maintainers. Only the six files from the pinned commit are extracted and
+verified against the same manifest; its current HEAD and working tree are
+ignored. A sibling checkout is never selected automatically.
+
+Complete firmware builds use the seed described below. It can be generated
+from public inputs; no separate source repository or private artifact download
+is required. Synthetic source tests and native loader builds need no firmware.
 
 ## Module profiles and exact-SKU inputs
 
@@ -57,19 +66,31 @@ synthetic source tests can run without the loader or firmware archives.
 The default is `helm-orin-nx-8gb-r39.2`. The family workflow combines two
 fixed inputs:
 
-- A qualified, unfused P3767-0001 R39.2 `zerosbk` catalog supplies the known
+- An unfused P3767-0001 R39.2 `zerosbk` catalog supplies the known
   boot-component policy headers, common recovery payloads, and fixed QSPI
-  partition layout. Its used files are individually SHA-256 pinned.
+  partition layout. All 17 used firmware files retain the individually pinned
+  SHA-256 values from the qualified seed. The 61-row partition layout is
+  separately pinned, including order, names, offsets, capacities, and attributes.
 - NVIDIA's official
   [`nvidia-l4t-bootloader` R39.2 package](https://repo.download.nvidia.com/jetson/som/pool/main/n/nvidia-l4t-bootloader/nvidia-l4t-bootloader_39.2.0-20260601141651_arm64.deb)
   supplies `TEGRA_BL_3767.Cap`, whose multi-spec BUP contains firmware, cold
   MB1/memory BCTs, GPTs, and version data for all five P3767 module specs. The
   package, capsule, and embedded BUP hashes are pinned.
 
-`HELM_R39_SEED_SIGNED_DIR` selects the qualified seed. `prepare` downloads the
+`HELM_R39_SEED_SIGNED_DIR` selects the verified seed. `prepare` downloads the
 official package when absent, extracts it with native libarchive, and creates
 an exact-SKU catalog under `build/helm-macos/family-inputs/`. The generator
-never executes a file from either NVIDIA archive.
+for this native family step never executes a file from either NVIDIA archive.
+
+The original seed index included random GPT identifiers and a build timestamp.
+Those historical payload hashes are not reproducible, and every populated
+index entry is replaced by verified capsule data or the pinned EKS component
+during family preparation. Layout validation therefore excludes the original
+payload sizes and hashes; it still checks every field that controls the output
+layout. The unused recovery-MB2 variant is no longer required: the recovery
+blob and QSPI image use the capsule's cold-boot MB2 with Helm's existing carrier
+EEPROM adjustment. The regenerated P3767-0001 QSPI image was compared
+byte-for-byte with the existing qualified image.
 
 The directory also supplies the five initial BootROM/MB1 transfer files:
 
@@ -111,6 +132,54 @@ qualification of the other four exact-SKU bundles remains a separate gate.
 
 ## Commands
 
+### Generating the firmware seed from public inputs
+
+Install Python 3 and start a Docker daemon with `linux/amd64` support (including
+emulation on Apple silicon). Allow space for the 1.29 GB BSP download and at
+least 4 GiB of container working space. Initial container setup needs network
+access for its pinned Ubuntu image and package installation.
+
+```sh
+python3 tools/helm-macos/generate-r39-seed.py \
+  --output build/inputs/r39.2/helm-orin-nx-8gb-r39.2
+```
+
+The script downloads the official BSP if it is missing, checks its pinned
+size and SHA-256, and invokes only NVIDIA's `--no-flash --no-systemimg --sign`
+workflow for the fixed P3767-0001 board configuration. It mounts no devices
+and never executes `flashcmd.txt`. All 17 firmware hashes and the fixed QSPI
+layout must pass verification before `signed/` is accepted. The generation
+log, exact container package versions, firmware hashes, and input provenance
+are retained next to `signed/`; the temporary container is removed.
+
+Use `--bsp-archive /path/to/Jetson_Linux_R39.2.0_aarch64.tbz2` for an existing
+archive. `--output` must be a new directory. A seed generated elsewhere can
+be selected with `HELM_R39_SEED_SIGNED_DIR=/path/to/output/signed`.
+
+### Using a prepared recovery bundle
+
+A complete bundle supplied for your exact module can be verified and used
+without the BSP or seed catalog. Build the included loader, then select the
+directory containing its six recovery payloads, `PROFILE`, and `SHA256SUMS`:
+
+```sh
+brew install libusb pkg-config
+./tools/helm-macos/helm-macos bootstrap
+
+export HELM_RCM_BUNDLE_DIR=/absolute/path/to/rcm-r39.2-p3767-0001
+./tools/helm-macos/helm-macos --profile helm-orin-nx-8gb-r39.2 verify
+```
+
+Use a bundle built from the reviewed source version you intend to install.
+Changing the source checkout does not update an existing bundle's embedded
+installer. `verify` checks the selected profile and file checksums without
+communicating with a board. Once verified, `./helm` runs the guided
+provisioning flow, with the same destructive-install confirmation as a
+locally built bundle. This repository does not currently supply a public
+bundle download.
+
+### Building from source
+
 ```sh
 brew install apko cmake cpio dtc libarchive libusb lz4 pkg-config zstd
 
@@ -118,7 +187,8 @@ brew install apko cmake cpio dtc libarchive libusb lz4 pkg-config zstd
 ./tools/helm-macos/helm-macos build
 ./tools/helm-macos/helm-macos profiles
 
-export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/qualified-p3767-0001/signed
+# Only needed when the seed is outside the default path:
+# export HELM_R39_SEED_SIGNED_DIR=/absolute/path/to/p3767-0001/signed
 
 ./tools/helm-macos/helm-macos \
   --profile helm-orin-nx-8gb-r39.2 prepare
